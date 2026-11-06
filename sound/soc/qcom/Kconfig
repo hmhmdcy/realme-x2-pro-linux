@@ -252,4 +252,14 @@ config SND_SOC_X1E80100
 	  X1E80100 SoC-based systems.
 	  Say Y or M if you want to use audio device on this SoCs.
 
+config SND_SOC_SAMURAI
+	tristate "Realme X2 Pro QDSP6 audio"
+	depends on QCOM_APR && I2C && OF && COMMON_CLK
+	select SND_SOC_QDSP6
+	select SND_SOC_QCOM_COMMON
+	select SND_SOC_WCD934X
+	select SND_SOC_MAX98937_SAMURAI
+	help
+	  Native Q6ASM/ADM/AFE, WCD934x SLIM and dual MAX98937 for Samurai.
+
 endif #SND_SOC_QCOM

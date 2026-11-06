@@ -234,6 +234,33 @@ bool drm_bridge_is_panel(const struct drm_bridge *bridge)
 EXPORT_SYMBOL(drm_bridge_is_panel);
 
 /**
+ * drm_panel_bridge_needs_first_frame - check for deferred panel illumination
+ * @bridge: bridge to examine, which may be a non-panel bridge
+ */
+bool drm_panel_bridge_needs_first_frame(struct drm_bridge *bridge)
+{
+	struct drm_panel *panel;
+
+	if (!bridge || !drm_bridge_is_panel(bridge))
+		return false;
+	panel = drm_bridge_to_panel_bridge(bridge)->panel;
+	return panel->delay_backlight_until_first_frame &&
+		READ_ONCE(panel->enabled) && !READ_ONCE(panel->backlight_ready);
+}
+EXPORT_SYMBOL_GPL(drm_panel_bridge_needs_first_frame);
+
+/**
+ * drm_panel_bridge_first_frame_done - notify a panel after pixel TX completion
+ * @bridge: panel bridge, or a non-panel bridge to ignore
+ */
+void drm_panel_bridge_first_frame_done(struct drm_bridge *bridge)
+{
+	if (bridge && drm_bridge_is_panel(bridge))
+		drm_panel_first_frame_done(drm_bridge_to_panel_bridge(bridge)->panel);
+}
+EXPORT_SYMBOL_GPL(drm_panel_bridge_first_frame_done);
+
+/**
  * drm_panel_bridge_add - Creates a &drm_bridge and &drm_connector that
  * just calls the appropriate functions from &drm_panel.
  *

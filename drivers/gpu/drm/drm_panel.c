@@ -32,6 +32,10 @@
 #include <drm/drm_panel.h>
 #include <drm/drm_print.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/drm_panel.h>
+#undef CREATE_TRACE_POINTS
+
 static DEFINE_MUTEX(panel_lock);
 static LIST_HEAD(panel_list);
 
@@ -70,6 +74,8 @@ static void drm_panel_init(struct drm_panel *panel, struct device *dev,
 	panel->dev = dev;
 	panel->funcs = funcs;
 	panel->connector_type = connector_type;
+	panel->delay_backlight_until_first_frame = false;
+	panel->backlight_ready = false;
 }
 
 /**
@@ -230,6 +236,50 @@ exit:
 }
 EXPORT_SYMBOL(drm_panel_unprepare);
 
+static void drm_panel_enable_backlight(struct drm_panel *panel)
+{
+	struct drm_panel_follower *follower;
+	int ret;
+
+	trace_drm_panel_backlight(dev_name(panel->dev), 1,
+				  panel->backlight ? panel->backlight->props.brightness : -1);
+	ret = backlight_enable(panel->backlight);
+	if (ret < 0)
+		DRM_DEV_INFO(panel->dev, "failed to enable backlight: %d\n",
+			     ret);
+
+	list_for_each_entry(follower, &panel->followers, list) {
+		if (!follower->funcs->panel_enabled)
+			continue;
+
+		ret = follower->funcs->panel_enabled(follower);
+		if (ret < 0)
+			dev_info(panel->dev, "%ps failed: %d\n",
+				 follower->funcs->panel_enabled, ret);
+	}
+}
+
+/**
+ * drm_panel_first_frame_done - illuminate a panel after a complete frame
+ * @panel: panel whose display controller has completed pixel transmission
+ *
+ * Call in sleepable commit context after a successful TX-complete wait.
+ * A CTL start, TE pulse or page-flip event alone is not sufficient.
+ */
+void drm_panel_first_frame_done(struct drm_panel *panel)
+{
+	if (!panel || !panel->delay_backlight_until_first_frame)
+		return;
+
+	mutex_lock(&panel->follower_lock);
+	if (panel->prepared && panel->enabled && !panel->backlight_ready) {
+		WRITE_ONCE(panel->backlight_ready, true);
+		drm_panel_enable_backlight(panel);
+	}
+	mutex_unlock(&panel->follower_lock);
+}
+EXPORT_SYMBOL_GPL(drm_panel_first_frame_done);
+
 /**
  * drm_panel_enable - enable a panel
  * @panel: DRM panel
@@ -242,7 +292,6 @@ EXPORT_SYMBOL(drm_panel_unprepare);
  */
 void drm_panel_enable(struct drm_panel *panel)
 {
-	struct drm_panel_follower *follower;
 	int ret;
 
 	if (!panel)
@@ -262,19 +311,14 @@ void drm_panel_enable(struct drm_panel *panel)
 	}
 	panel->enabled = true;
 
-	ret = backlight_enable(panel->backlight);
-	if (ret < 0)
-		DRM_DEV_INFO(panel->dev, "failed to enable backlight: %d\n",
-			     ret);
+	WRITE_ONCE(panel->backlight_ready,
+		   !panel->delay_backlight_until_first_frame);
+	if (panel->backlight_ready) {
+		drm_panel_enable_backlight(panel);
+	} else {
+		int brightness = panel->backlight ? panel->backlight->props.brightness : -1;
 
-	list_for_each_entry(follower, &panel->followers, list) {
-		if (!follower->funcs->panel_enabled)
-			continue;
-
-		ret = follower->funcs->panel_enabled(follower);
-		if (ret < 0)
-			dev_info(panel->dev, "%ps failed: %d\n",
-				 follower->funcs->panel_enabled, ret);
+		trace_drm_panel_backlight(dev_name(panel->dev), 0, brightness);
 	}
 
 exit:
@@ -314,15 +358,19 @@ void drm_panel_disable(struct drm_panel *panel)
 
 	mutex_lock(&panel->follower_lock);
 
-	list_for_each_entry(follower, &panel->followers, list) {
-		if (!follower->funcs->panel_disabling)
-			continue;
+	if (!panel->delay_backlight_until_first_frame || panel->backlight_ready) {
+		list_for_each_entry(follower, &panel->followers, list) {
+			if (!follower->funcs->panel_disabling)
+				continue;
 
-		ret = follower->funcs->panel_disabling(follower);
-		if (ret < 0)
-			dev_info(panel->dev, "%ps failed: %d\n",
-				 follower->funcs->panel_disabling, ret);
+			ret = follower->funcs->panel_disabling(follower);
+			if (ret < 0)
+				dev_info(panel->dev, "%ps failed: %d\n",
+					 follower->funcs->panel_disabling, ret);
+		}
 	}
+	WRITE_ONCE(panel->backlight_ready, false);
+	trace_drm_panel_backlight(dev_name(panel->dev), 2, 0);
 
 	ret = backlight_disable(panel->backlight);
 	if (ret < 0)

@@ -1416,3 +1416,11 @@ config DRM_PANEL_XINPENG_XPP055C272
 	  XPP055C272 controller for 720x1280 LCD panels with MIPI/RGB/SPI
 	  system interfaces.
 endmenu
+
+config DRM_PANEL_SAMSUNG_SOFEF03F
+	tristate "Samsung SOFEF03F_M DSC command mode panel"
+	depends on OF && GPIOLIB && DRM_MIPI_DSI && BACKLIGHT_CLASS_DEVICE
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_DSC_HELPER
+	help
+	  Samsung SOFEF03F_M 1080x2400 AMOLED panel in the Realme X2 Pro.

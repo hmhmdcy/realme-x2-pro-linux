@@ -125,5 +125,14 @@ static inline struct dpu_hw_sspp *dpu_rm_get_sspp(struct dpu_rm *rm, enum dpu_ss
 	return rm->hw_sspp[sspp_idx - SSPP_NONE];
 }
 
+/**
+ * dpu_rm_clear_boot_config() - quiesce inherited command-mode CTLs on SM8150
+ * @rm: Initialized resource manager
+ * @cat: SM8150 hardware catalog
+ *
+ * Return: 0 on success or a negative reset error.
+ */
+int dpu_rm_clear_boot_config(struct dpu_rm *rm, const struct dpu_mdss_cfg *cat);
+
 #endif /* __DPU_RM_H__ */
 

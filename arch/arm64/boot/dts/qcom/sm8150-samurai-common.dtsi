@@ -1,0 +1,1082 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Realme X2 Pro (RMX1931CN), codename "samurai" - Qualcomm SM8150-AC
+ * (msmnile / Snapdragon 855+).
+ *
+ * Bring-up description, not an upstream submission yet.  Every number below
+ * comes from this handset's own firmware, i.e. from the base DTB appended to
+ * the stock boot image, from the DTBO overlays it is matched with
+ * (oppo,dtsi_no = 19781) or from a live /proc/device-tree dump of the running
+ * Android system.  The MTP reference board is the closest starting point -
+ * the stock base DTB literally reports "Qualcomm Technologies, Inc. SM8150 v2
+ * SoC" with the MTP board id - and it supplies the PM8150 regulator topology
+ * that the overlays (which reference pm8150_l9/l10/s4) build upon.
+ *
+ * Deviations from the vendor description are marked "VENDOR:".
+ */
+
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+#include "sm8150-mtp.dts"
+
+/ {
+	model = "Realme X2 Pro (RMX1931CN)";
+	compatible = "realme,samurai", "qcom,sm8150";
+	chassis-type = "handset";
+
+
+	chosen {
+		/*
+		 * The MTP serial console is not wired on this board.  Logs come
+		 * from the Qualcomm EUD COM peripheral instead: the EDK2 port of
+		 * this device enables EUD before booting the OS, so a host PC can
+		 * have the COM port open before the kernel starts.
+		 */
+		/delete-property/ stdout-path;
+		bootargs = "earlycon=eud,mmio,0x88e0000 console=tty0 console=eud loglevel=7 ignore_loglevel panic=15 clk_ignore_unused pd_ignore_unused regulator_ignore_unused";
+	};
+
+	/* 19781 vendor DTS/common power code: PM8150L GPIO5 high enables VIO. */
+	vreg_touch_1p8: regulator-touch-1p8 {
+		compatible = "regulator-fixed";
+		regulator-name = "touch-vio-1p8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&pm8150l_gpios 5 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		pinctrl-names = "default";
+		pinctrl-0 = <&touch_vio_enable_default>;
+	};
+
+	/*
+	 * The volume keys are PM8150 GPIOs, not the MTP's pon_resin (which is
+	 * disabled below).  Pin state, active-low flag, key codes and debounce
+	 * interval are copied from the vendor overlay / live tree.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+		label = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&key_vol_up_default>, <&key_vol_down_default>;
+
+		key-vol-up {
+			label = "volume_up";
+			gpios = <&pm8150_gpios 6 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_KEY>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
+
+		key-vol-down {
+			label = "volume_down";
+			gpios = <&pm8150_gpios 7 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_KEY>;
+			linux,code = <KEY_VOLUMEDOWN>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
+	};
+
+	/*
+	 * Firmware carve-outs of this device.  The reference board layout is
+	 * not just shifted - the whole remote-processor area sits roughly
+	 * 0x8D400000 higher and the firmware region above 0xA0000000 has no
+	 * MTP counterpart at all.  Getting this wrong means the kernel happily
+	 * allocates over XBL/AOP or a DSP image.
+	 *
+	 * /memory itself is left at the reference board's
+	 * "bootloader fills in the size" placeholder on purpose: ABL patches it
+	 * in the stock boot chain, and when EDK2 hands this DTB to the kernel
+	 * through the EFI configuration table the RAM description comes from
+	 * the EFI memory map (drivers/firmware/efi/efi-init.c), not from here.
+	 */
+	reserved-memory {
+		/* RMX1931 firmware IFE exclusions, enforced by the IOMMU core. */
+		camss_iova_resv: reservation-camss-ife {
+			iommu-addresses = <&camss 0 0 0 0x07400000>,
+					  <&camss 0 0xe0000000 0 0x20000000>;
+		};
+
+		/delete-node/ memory@85d00000;	/* MTP xbl_mem 0x85d00000+0x140000 */
+		/delete-node/ memory@85f00000;	/* MTP aop_mem 0x85f00000+0x20000 */
+		/delete-node/ memory@89b00000;	/* MTP rmtfs_mem: not present here */
+		/delete-node/ memory@8b700000;	/* MTP camera_mem */
+		/delete-node/ memory@8bc00000;	/* MTP wlan_mem */
+		/delete-node/ memory@8bd80000;	/* MTP npu_mem */
+		/delete-node/ memory@8be00000;	/* MTP adsp_mem */
+		/delete-node/ memory@8d800000;	/* MTP mpss_mem */
+		/delete-node/ memory@96e00000;	/* MTP venus_mem */
+		/delete-node/ memory@97300000;	/* MTP slpi_mem */
+		/delete-node/ memory@98700000;	/* MTP ipa_fw_mem */
+		/delete-node/ memory@98710000;	/* MTP ipa_gsi_mem */
+		/delete-node/ memory@98715000;	/* MTP gpu_mem */
+		/delete-node/ memory@98800000;	/* MTP spss_mem */
+		/delete-node/ memory@98900000;	/* MTP cdsp_mem */
+		/delete-node/ memory@9e400000;	/* MTP qseecom_mem */
+
+		/*
+		 * Stock sharedmem-uio allocates 2 MiB dynamically with 4 KiB guards,
+		 * client 1 and HLOS/MSS_MSA RW permissions. Allocate from EFI-described
+		 * HLOS RAM below 4 GiB; never reuse the MTP address inside this board's TZ.
+		 */
+		/* Stock FastRPC heap: 16 MiB, below 4 GiB in EFI-described HLOS RAM. */
+		samurai_fastrpc_heap: fastrpc-shared-pool {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x0 0x1000000>;
+			alignment = <0x0 0x400000>;
+			alloc-ranges = <0x0 0xc0000000 0x0 0x30000000>;
+		};
+
+		samurai_rmtfs_mem: rmtfs-dynamic {
+			compatible = "qcom,rmtfs-mem";
+			size = <0x0 0x202000>;
+			alignment = <0x0 0x1000>;
+			alloc-ranges = <0x0 0xc0000000 0x0 0x30000000>;
+			no-map;
+			qcom,client-id = <1>;
+			qcom,use-guard-pages;
+			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
+		};
+
+		/* hyp_mem, smem_mem and aop_cmd_db are correct as inherited. */
+
+		/* tz_mem: the device reserves three times the MTP's 0x3900000. */
+		tz_mem: memory@86200000 {
+			reg = <0x0 0x86200000 0x0 0x7500000>;
+			no-map;
+		};
+
+		xbl_aop_mem: memory@85e00000 {
+			reg = <0x0 0x85e00000 0x0 0x120000>;
+			no-map;
+		};
+
+		mpss_mem: memory@8dc00000 {
+			reg = <0x0 0x8dc00000 0x0 0xa000000>;
+			no-map;
+		};
+
+		venus_mem: memory@97c00000 {
+			reg = <0x0 0x97c00000 0x0 0x500000>;
+			no-map;
+		};
+
+		slpi_mem: memory@98100000 {
+			reg = <0x0 0x98100000 0x0 0x1400000>;
+			no-map;
+		};
+
+		ipa_fw_mem: memory@99500000 {
+			reg = <0x0 0x99500000 0x0 0x10000>;
+			no-map;
+		};
+
+		ipa_gsi_mem: memory@99510000 {
+			reg = <0x0 0x99510000 0x0 0x5000>;
+			no-map;
+		};
+
+		gpu_mem: memory@99515000 {
+			reg = <0x0 0x99515000 0x0 0x2000>;
+			no-map;
+		};
+
+		spss_mem: memory@99600000 {
+			reg = <0x0 0x99600000 0x0 0x100000>;
+			no-map;
+		};
+
+		cdsp_mem: memory@99700000 {
+			reg = <0x0 0x99700000 0x0 0x1400000>;
+			no-map;
+		};
+
+		camera_mem: memory@9ab00000 {
+			reg = <0x0 0x9ab00000 0x0 0x500000>;
+			no-map;
+		};
+
+		wlan_mem: memory@9b000000 {
+			reg = <0x0 0x9b000000 0x0 0x180000>;
+			no-map;
+		};
+
+		npu_mem: memory@9b180000 {
+			reg = <0x0 0x9b180000 0x0 0x80000>;
+			no-map;
+		};
+
+		adsp_mem: memory@9b200000 {
+			reg = <0x0 0x9b200000 0x0 0x1e00000>;
+			no-map;
+		};
+
+		/*
+		 * The bootloader splash lives here.  The vendor keeps it mapped
+		 * (no no-map), so the display driver can pick the framebuffer up
+		 * later; keep it that way.
+		 */
+		splash_mem: memory@9d000000 {
+			reg = <0x0 0x9d000000 0x0 0x2400000>;
+		};
+
+		qseecom_mem: memory@a0000000 {
+			reg = <0x0 0xa0000000 0x0 0x1400000>;
+			no-map;
+		};
+
+		cdsp_sec_mem: memory@a4c00000 {
+			reg = <0x0 0xa4c00000 0x0 0xc00000>;
+			no-map;
+		};
+
+		/*
+		 * The stock firmware already has a ramoops region here, so this
+		 * mirrors where Android dumps its panics.  The vendor geometry
+		 * (record/console/ftrace 1 KiB, pmsg 8 KiB, plus a 1 MiB
+		 * "devinfo" area) is useless for a bring-up log and devinfo-size
+		 * is a downstream-only property, so a whole-boot log is kept
+		 * instead.  Still inside the same 4 MiB region.
+		 */
+		ramoops: ramoops@b7e00000 {
+			compatible = "ramoops";
+			reg = <0x0 0xb7e00000 0x0 0x400000>;
+			record-size = <0x40000>;
+			console-size = <0x40000>;
+			ftrace-size = <0x40000>;
+			pmsg-size = <0x200000>;
+			ecc-size = <0x0>;
+		};
+	};
+};
+
+/* Adreno firmware is supplied by the initramfs from this handset's vendor. */
+&gmu {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
+&gpu_zap_shader {
+	firmware-name = "qcom/sm8150/realme/samurai/a640_zap.mbn";
+};
+
+/* Remaining firmware-dependent peripherals are brought up separately. */
+
+&wifi {
+	status = "okay";
+};
+
+&remoteproc_adsp {
+	firmware-name = "qcom/sm8150/realme/samurai/adsp.mdt";
+	status = "okay";
+
+	glink-edge {
+		apr {
+			compatible = "qcom,apr-v2";
+			qcom,glink-channels = "apr_audio_svc";
+			qcom,domain = <4>;
+			qcom,intents = <512 20>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			service@3 {
+				compatible = "qcom,q6core";
+				reg = <3>;
+				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+			};
+		};
+	};
+};
+
+&remoteproc_cdsp {
+	status = "disabled";
+};
+
+/* PAS auto_boot is false: expose MPSS for explicit firmware tests only. */
+&remoteproc_mpss {
+	firmware-name = "qcom/sm8150/realme/samurai/modem.mdt";
+	status = "okay";
+};
+
+/* Registered but not auto-booted: first SLPI experiment is explicit. */
+&remoteproc_slpi {
+	firmware-name = "qcom/sm8150/realme/samurai/slpi.mdt";
+	status = "okay";
+
+	glink-edge {
+		fastrpc {
+			memory-region = <&samurai_fastrpc_heap>;
+			/* Stock adsprpc: HLOS, SSC_Q6, ADSP_Q6; no modem access. */
+			qcom,vmids = <3 5 6>;
+		};
+	};
+};
+
+&uart2 {
+	status = "disabled";
+};
+
+/* pon_resin is the MTP's volume-down key; this device uses PM8150 GPIO 7. */
+&pon_resin {
+	status = "disabled";
+};
+
+&pm8150_gpios {
+	key_vol_up_default: key-vol-up-default-state {
+		pins = "gpio6";
+		function = "normal";
+		input-enable;
+		bias-disable;
+		power-source = <1>;
+	};
+
+	key_vol_down_default: key-vol-down-default-state {
+		pins = "gpio7";
+		function = "normal";
+		input-enable;
+		bias-disable;
+		power-source = <1>;
+	};
+};
+
+/*
+ * UFS keeps the reference board's supplies - the vendor overlay sets exactly
+ * the same rails (vcc = pm8150_l10, vccq = pm8150_l9, vccq2 = pm8150_s4), so
+ * there is nothing to change here.  USB gadget mode and the DWC3 SMMU stream
+ * (apps_smmu 0x140) are already described by sm8150-mtp.dts / sm8150.dtsi.
+ */
+
+/*
+ * EUD COM console.  The full EUD block has no usable binding here: the in-tree
+ * qcom,eud driver wants a USB role switch and SCM access to enable secure EUD,
+ * and this handset has neither.  All the console needs is the register window
+ * of the COM FIFO, which the EDK2 port already leaves enabled.
+ */
+&soc {
+        eud_com: serial@88e0000 {
+                compatible = "qcom,sm8150-eud-com";
+                reg = <0 0x88e0000 0 0x2000>;
+                status = "okay";
+        };
+};
+
+/* F1 (2026-10-08): reboot straight into fastboot / recovery from Linux.
+ * The stock DTB already carries these magics; mainline qcom-pon.c speaks the
+ * generic reboot-mode framework and matches the "mode-" prefix.
+ */
+&pon {
+	mode-bootloader = <0x02>;
+	mode-recovery   = <0x01>;
+};
+
+/* SM8150-AC: this frequency is present in the firmware CPU7 LUT.
+ * Match the SM8150 high-frequency OPP used by the maintained SoC tree;
+ * voltage comes from the hardware LUT, not a fixed board voltage.
+ */
+&cpu7_opp_table {
+	cpu7_opp21: opp-2956800000 {
+		opp-hz = /bits/ 64 <2956800000>;
+		opp-peak-kBps = <8368000 51609600>;
+	};
+};
+
+/* S3706 wiring from this handset's 19781 overlay and saved Android tree. */
+&gpi_dma2 {
+	status = "okay";
+};
+
+&qupv3_id_2 {
+	status = "okay";
+};
+
+/* Stock QUP1 wiring; no charger client or charging policy is bound. */
+&gpi_dma0 {
+	status = "okay";
+};
+
+&qupv3_id_0 {
+	status = "okay";
+};
+
+&i2c1 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/* QUP1 / 0x5c, verified MP2650: read-only power_supply observation. */
+	charger@5c {
+		compatible = "mps,mp2650";
+		reg = <0x5c>;
+	};
+};
+
+/* Stock BQ28Z610 at QUP15: standard read-only battery monitoring. */
+&i2c15 {
+	clock-frequency = <100000>;
+	status = "okay";
+
+	fuel-gauge@55 {
+		compatible = "ti,bq28z610";
+		reg = <0x55>;
+	};
+};
+
+&i2c17 {
+	status = "okay";
+
+	touchscreen@20 {
+		compatible = "syna,rmi4-i2c";
+		reg = <0x20>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <122 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 54 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&touch_irq_default &touch_reset_default>;
+		vdd-supply = <&vreg_l17a_3p0>;
+		vio-supply = <&vreg_touch_1p8>;
+		/* Vendor: 10 ms power-to-reset release, 80 ms reset-to-normal. */
+		syna,startup-delay-ms = <80>;
+		syna,reset-delay-ms = <80>;
+
+		rmi4-f12@12 {
+			reg = <0x12>;
+			syna,sensor-type = <1>;
+			touchscreen-size-x = <1080>;
+			touchscreen-size-y = <2400>;
+		};
+	};
+};
+
+&vreg_l17a_3p0 {
+	regulator-min-microvolt = <3000000>;
+	regulator-max-microvolt = <3000000>;
+};
+
+&pm8150l_gpios {
+	touch_vio_enable_default: touch-vio-enable-default-state {
+		pins = "gpio5";
+		function = "normal";
+		bias-disable;
+		power-source = <0>;
+		qcom,drive-strength = <3>;
+		drive-push-pull;
+	};
+};
+
+&tlmm {
+	touch_irq_default: touch-irq-default-state {
+		pins = "gpio122";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	touch_reset_default: touch-reset-default-state {
+		pins = "gpio54";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+};
+
+/* Native display: wiring and rail values verified against stock live DT. */
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	status = "okay";
+	vdda-supply = <&vreg_l3c_1p2>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&display_te_default>;
+
+	panel@0 {
+		compatible = "samsung,sofef03f-m";
+		reg = <0>;
+		vddio-supply = <&vreg_l14a_1p8>;
+		vdda-supply = <&vreg_l17a_3p0>;
+		reset-gpios = <&tlmm 6 GPIO_ACTIVE_LOW>;
+		vci-enable-gpios = <&tlmm 25 GPIO_ACTIVE_HIGH>;
+		vddd-enable-gpios = <&tlmm 152 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&display_reset_default>, <&display_power_default>;
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi0_phy {
+	status = "okay";
+	vdds-supply = <&vreg_l5a_0p875>;
+};
+
+&vreg_l14a_1p8 {
+	regulator-min-microvolt = <1800000>;
+	regulator-max-microvolt = <1800000>;
+};
+
+&tlmm {
+	display_reset_default: display-reset-default-state {
+		pins = "gpio6";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+	display_power_default: display-power-default-state {
+		pins = "gpio25", "gpio152";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+	display_te_default: display-te-default-state {
+		pins = "gpio8";
+		function = "mdp_vsync";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+};
+
+/* Session92: same-handset Android UART13 and NQ-NCI wiring. */
+&gpi_dma1 { status = "okay"; };
+&qupv3_id_1 { status = "okay"; };
+
+&tlmm {
+    samurai_bt_uart_default: samurai-bt-uart-default-state {
+        pins = "gpio43", "gpio44", "gpio45", "gpio46";
+        function = "qup13";
+        drive-strength = <2>;
+        bias-disable;
+    };
+    samurai_nfc_irq_default: samurai-nfc-irq-default-state {
+        pins = "gpio47";
+        function = "gpio";
+        drive-strength = <2>;
+        bias-disable;
+        input-enable;
+    };
+};
+
+&uart13 {
+    status = "okay";
+    /delete-property/ interrupts;
+    interrupts-extended = <&intc GIC_SPI 585 IRQ_TYPE_LEVEL_HIGH>,
+                          <&tlmm 46 IRQ_TYPE_EDGE_FALLING>;
+    pinctrl-names = "default", "sleep";
+    pinctrl-0 = <&samurai_bt_uart_default>;
+    pinctrl-1 = <&samurai_bt_uart_sleep_ctsrts>,
+                <&samurai_bt_uart_sleep_txrx>;
+    bluetooth {
+        compatible = "qcom,wcn3990-bt";
+        /* Same-handset revision-21 files; ROM 0x1001 derives a missing 01 name. */
+        firmware-name = "crnv21.bin", "crbtfw21.tlv";
+        /* Logic rail shares the existing WCN supply; no voltage is changed. */
+        vddio-supply = <&vreg_l1a_0p75>;
+        vddxo-supply = <&vreg_l7a_1p8>;
+        vddrf-supply = <&vreg_l2c_1p3>;
+        vddch0-supply = <&vreg_l11c_3p3>;
+        max-speed = <3200000>;
+    };
+};
+
+&i2c9 {
+    status = "okay";
+    clock-frequency = <400000>;
+    nfc@28 {
+        compatible = "nxp,nxp-nci-i2c";
+        reg = <0x28>;
+        interrupt-parent = <&tlmm>;
+        interrupts = <47 IRQ_TYPE_LEVEL_HIGH>;
+        enable-gpios = <&tlmm 36 GPIO_ACTIVE_HIGH>;
+        firmware-gpios = <&tlmm 48 GPIO_ACTIVE_HIGH>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&samurai_nfc_irq_default>;
+    };
+};
+
+/* 19781 same-handset wiring; no reset-line sharing with other devices. */
+&i2c7 {
+	status = "okay";
+	clock-frequency = <400000>;
+
+	haptics@5a {
+		compatible = "realme,samurai-aw8697", "awinic,aw8697";
+		reg = <0x5a>;
+		reset-gpios = <&tlmm 116 GPIO_ACTIVE_LOW>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <24 IRQ_TYPE_EDGE_FALLING>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&haptics_reset_default &haptics_irq_default>;
+	};
+};
+
+&tlmm {
+	haptics_reset_default: haptics-reset-default-state {
+		pins = "gpio116";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+
+	haptics_irq_default: haptics-irq-default-state {
+		pins = "gpio24";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		input-enable;
+	};
+};
+
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * RMX1931/19781 audio transport. Resources agree with the stock MTP overlay
+ * and Realme's 19781 source. The two MAX98927s use QUP4 I2C on GPIO51/52;
+ * the unrelated vendor SPI pin override on GPIO53/54 is not an I2C mapping.
+ * No machine card or speaker playback is enabled by this fragment.
+ */
+&soc {
+	samurai_slimbam: dma-controller@17184000 {
+		compatible = "qcom,bam-v1.7.4", "qcom,bam-v1.7.0";
+		reg = <0 0x17184000 0 0x2c000>;
+		interrupts = <GIC_SPI 164 IRQ_TYPE_LEVEL_HIGH>;
+		#dma-cells = <1>;
+		qcom,controlled-remotely;
+		num-channels = <31>;
+		qcom,ee = <1>;
+		qcom,num-ees = <2>;
+		iommus = <&apps_smmu 0x1b46 0>;
+	};
+
+	samurai_slim: slim-ngd@171c0000 {
+		compatible = "qcom,slim-ngd-v2.1.0";
+		reg = <0 0x171c0000 0 0x2c000>;
+		interrupts = <GIC_SPI 163 IRQ_TYPE_LEVEL_HIGH>;
+		dmas = <&samurai_slimbam 3>, <&samurai_slimbam 4>;
+		dma-names = "rx", "tx";
+		iommus = <&apps_smmu 0x1b46 0>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+
+		slim@1 {
+			reg = <1>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			samurai_wcd_ifd: ifd@0,0 {
+				compatible = "slim217,250";
+				reg = <0 0>;
+			};
+
+			samurai_wcd: codec@1,0 {
+				compatible = "slim217,250";
+				reg = <1 0>;
+				slim-ifc-dev = <&samurai_wcd_ifd>;
+				#sound-dai-cells = <1>;
+				interrupts-extended = <&tlmm 123 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				clock-names = "extclk";
+				clocks = <&rpmhcc RPMH_LN_BB_CLK2>;
+				#clock-cells = <0>;
+				clock-frequency = <9600000>;
+				clock-output-names = "mclk";
+				/* Native MFD drives logical 0 then 1: physical low then high. */
+				reset-gpios = <&tlmm 143 GPIO_ACTIVE_HIGH>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&samurai_wcd_irq_default>;
+				vdd-buck-supply = <&vreg_s4a_1p8>;
+				vdd-buck-sido-supply = <&vreg_s4a_1p8>;
+				vdd-tx-supply = <&vreg_s4a_1p8>;
+				vdd-rx-supply = <&vreg_s4a_1p8>;
+				vdd-io-supply = <&vreg_s4a_1p8>;
+				qcom,micbias1-microvolt = <1800000>;
+				qcom,micbias2-microvolt = <2700000>;
+				qcom,micbias3-microvolt = <1800000>;
+				qcom,micbias4-microvolt = <1800000>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				samurai_wcdgpio: gpio@42 {
+					compatible = "qcom,wcd9340-gpio";
+					reg = <0x42 0x2>;
+					gpio-controller;
+					#gpio-cells = <2>;
+				};
+			};
+		};
+	};
+};
+
+&tlmm {
+	samurai_wcd_irq_default: samurai-wcd-irq-default-state {
+		pins = "gpio123";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+};
+
+&i2c4 {
+	status = "okay";
+	clock-frequency = <100000>;
+
+	samurai_amp_left: amplifier@39 {
+		compatible = "maxim,max98927";
+		reg = <0x39>;
+		#sound-dai-cells = <0>;
+		/* Native MAX98927 asserts logical 1 then deasserts 0. */
+		reset-gpios = <&tlmm 148 GPIO_ACTIVE_LOW>;
+		maxim,interleave-mode;
+	};
+
+	samurai_amp_right: amplifier@3a {
+		compatible = "maxim,max98927";
+		reg = <0x3a>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&tlmm 37 GPIO_ACTIVE_LOW>;
+		maxim,interleave-mode;
+	};
+};
+
+/* SPDX-License-Identifier: GPL-2.0-only */
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+
+&samurai_amp_left {
+	compatible = "realme,samurai-max98937", "maxim,max98937";
+	/delete-property/ maxim,interleave-mode;
+	vdd-supply = <&vreg_s4a_1p8>;
+	realme,pcm-channel = <0>;
+	sound-name-prefix = "Left";
+};
+&samurai_amp_right {
+	compatible = "realme,samurai-max98937", "maxim,max98937";
+	/delete-property/ maxim,interleave-mode;
+	vdd-supply = <&vreg_s4a_1p8>;
+	realme,pcm-channel = <1>;
+	sound-name-prefix = "Right";
+};
+
+&remoteproc_adsp {
+	glink-edge {
+		apr {
+			service@4 {
+				compatible = "qcom,q6afe";
+				reg = <4>;
+				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+				samurai_q6afe: dais {
+					compatible = "qcom,q6afe-dais";
+					#address-cells = <1>;
+					#size-cells = <0>;
+					#sound-dai-cells = <1>;
+					pinctrl-names = "default", "sleep";
+					pinctrl-0 = <&samurai_quat_audio>;
+					pinctrl-1 = <&samurai_quat_sleep>;
+					dai@16 {
+						reg = <QUATERNARY_MI2S_RX>;
+						qcom,sd-lines = <1>;
+					};
+				};
+			};
+			service@7 {
+				compatible = "qcom,q6asm";
+				reg = <7>;
+				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+				samurai_q6asm: dais {
+					compatible = "qcom,q6asm-dais";
+					#address-cells = <1>;
+					#size-cells = <0>;
+					#sound-dai-cells = <1>;
+					/* SM8150 upstream port, independently matched to OEM audio SID. */
+					iommus = <&apps_smmu 0x1b21 0>;
+					dai@0 { reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>; direction = <Q6ASM_DAI_RX>; };
+					dai@1 { reg = <MSM_FRONTEND_DAI_MULTIMEDIA2>; direction = <Q6ASM_DAI_TX>; };
+				};
+			};
+			service@8 {
+				compatible = "qcom,q6adm";
+				reg = <8>;
+				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+				samurai_q6routing: routing {
+					compatible = "qcom,q6adm-routing";
+					#sound-dai-cells = <0>;
+				};
+			};
+		};
+	};
+};
+
+&tlmm {
+	samurai_quat_audio: samurai-quat-audio-state {
+		pins = "gpio137", "gpio138", "gpio140";
+		function = "qua_mi2s";
+		drive-strength = <8>;
+		bias-disable;
+	};
+	samurai_quat_sleep: samurai-quat-sleep-state {
+		pins = "gpio137", "gpio138", "gpio140";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+};
+
+/ {
+	samurai_sound: sound {
+		compatible = "realme,samurai-audio";
+		model = "Realme X2 Pro";
+		widgets = "Speaker", "Left Speaker", "Speaker", "Right Speaker",
+			  "Headphone", "Headphone Jack", "Microphone", "Handset Mic",
+			  "Microphone", "Secondary Mic", "Microphone", "Speaker Mic",
+			  "Microphone", "Mic Jack";
+		audio-routing = "Left Speaker", "Left OUT", "Right Speaker", "Right OUT",
+				"Headphone Jack", "HPHL", "Headphone Jack", "HPHR",
+				"AMIC2", "Mic Jack", "AMIC2", "MIC BIAS2", "AMIC2", "MCLK",
+				/* Native WCD934x uses distinct DMIC input pins and supplies. */
+                "DMIC0 Pin", "Handset Mic", "DMIC0", "MIC BIAS1", "DMIC0", "MCLK",
+                "DMIC1 Pin", "Secondary Mic", "DMIC1", "MIC BIAS1", "DMIC1", "MCLK",
+                "DMIC2 Pin", "Speaker Mic", "DMIC2", "MIC BIAS3", "DMIC2", "MCLK";
+		pin-switches = "Left Speaker", "Right Speaker", "Headphone Jack", "Handset Mic", "Secondary Mic", "Speaker Mic";
+
+		playback-dai-link {
+			link-name = "MultiMedia1";
+			cpu { sound-dai = <&samurai_q6asm MSM_FRONTEND_DAI_MULTIMEDIA1>; };
+		};
+		capture-dai-link {
+			link-name = "MultiMedia2";
+			cpu { sound-dai = <&samurai_q6asm MSM_FRONTEND_DAI_MULTIMEDIA2>; };
+		};
+		speaker-dai-link {
+			link-name = "Quaternary MI2S";
+			cpu { sound-dai = <&samurai_q6afe QUATERNARY_MI2S_RX>; };
+			platform { sound-dai = <&samurai_q6routing>; };
+			codec { sound-dai = <&samurai_amp_left>, <&samurai_amp_right>; };
+		};
+		headphone-dai-link {
+			link-name = "SLIMBUS_0_RX";
+			cpu { sound-dai = <&samurai_q6afe SLIMBUS_0_RX>; };
+			platform { sound-dai = <&samurai_q6routing>; };
+			codec { sound-dai = <&samurai_wcd 0>; };
+		};
+		microphone-dai-link {
+			link-name = "SLIMBUS_0_TX";
+			cpu { sound-dai = <&samurai_q6afe SLIMBUS_0_TX>; };
+			platform { sound-dai = <&samurai_q6routing>; };
+			codec { sound-dai = <&samurai_wcd 1>; };
+		};
+	};
+};
+
+/* Official board19781 SSC supplies; follow SLPI remoteproc lifecycle. */
+/ {
+    samurai_sensor_power: sensor-power {
+        compatible = "realme,samurai-sensor-power";
+        qcom,rproc = <&remoteproc_slpi>;
+        vdd-supply = <&vreg_l7c_3p0>;
+        vddio-supply = <&vreg_l8c_1p8>;
+    };
+};
+
+/* Same-handset stock PIL loader and firmware reservation. */
+&ipa {
+	status = "okay";
+	qcom,gsi-loader = "self";
+	memory-region = <&ipa_fw_mem>;
+	firmware-name = "qcom/sm8150/realme/samurai/ipa_fws.mdt";
+};
+
+/* Native 19781 CSIPHY rail; CAMSS remains disabled pending sensor/CPAS proof. */
+&camss {
+	/* Physical front sensor and internal CSID test-pattern support. */
+	status = "okay";
+	vdda-phy-supply = <&vreg_l3c_1p2>;
+};
+
+&tlmm {
+    samurai_bt_uart_sleep_ctsrts: samurai-bt-uart-sleep-ctsrts-state {
+        pins = "gpio43", "gpio44";
+        function = "gpio";
+        drive-strength = <2>;
+        /* CTS matches the controller; active-low RTS permits RX wake. */
+        bias-pull-down;
+    };
+
+    samurai_bt_uart_sleep_txrx: samurai-bt-uart-sleep-txrx-state {
+        pins = "gpio45", "gpio46";
+        function = "gpio";
+        drive-strength = <2>;
+        /* Keep idle TX and the RX wake input high while GENI sleeps. */
+        bias-pull-up;
+    };
+};
+
+/* Realme X2 Pro front camera, verified with physical IMX471 RAW frames. */
+#include <dt-bindings/clock/qcom,sm8150-camcc.h>
+#include <dt-bindings/media/video-interfaces.h>
+
+
+
+&i2c4 {
+	/* VINs are incomplete: product configuration keeps P disabled. */
+	cam_pmic_p: pmic@8 {
+		compatible = "qcom,pm8008";
+		reg = <8>;
+		reset-gpios = <&pm8150l_gpios 1 GPIO_ACTIVE_LOW>;
+		vdd-l1-l2-supply = <&vreg_s8c_1p3>;
+		qcom,address-setup-supplier = <&cam_pmic_q>;
+		status = "okay";
+	};
+
+	cam_pmic_q: pmic@4 {
+		compatible = "qcom,pm8008";
+		reg = <4>;
+		qcom,initial-address = <8>;
+		reset-gpios = <&pm8150l_gpios 4 GPIO_ACTIVE_LOW>;
+		vdd-l1-l2-supply = <&vreg_s8c_1p3>;
+
+		/* The four PLDO input nets have not yet been identified. */
+		regulators {
+			cam_front_vdig: ldo2 {
+				regulator-name = "cam-front-vdig";
+				regulator-min-microvolt = <1050000>;
+				regulator-max-microvolt = <1056000>;
+				regulator-enable-ramp-delay = <1000>;
+			};
+
+			cam_front_vana: ldo5 {
+				regulator-name = "cam-front-vana";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+				regulator-enable-ramp-delay = <1000>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	cam_front_mclk_active: camera-front-mclk-active-state {
+		pins = "gpio15";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_front_mclk_sleep: camera-front-mclk-sleep-state {
+		pins = "gpio15";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+
+	cam_front_select_active: camera-front-select-active-state {
+		pins = "gpio29";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	cam_front_select_sleep: camera-front-select-sleep-state {
+		pins = "gpio29";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+
+	cam_front_reset: camera-front-reset-state {
+		pins = "gpio12";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+};
+
+&cci1 {
+	status = "okay";
+};
+
+&cci1_i2c1 {
+	cam_front: camera@10 {
+		compatible = "sony,imx471";
+		reg = <0x10>;
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+		vana-supply = <&cam_front_vana>;
+		vdig-supply = <&cam_front_vdig>;
+		vif-supply = <&vreg_l1c_1p8>;
+		clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clock-rates = <19200000>;
+		reset-gpios = <&tlmm 12 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_front_mclk_active &cam_front_select_active &cam_front_reset>;
+		pinctrl-1 = <&cam_front_mclk_sleep &cam_front_select_sleep &cam_front_reset>;
+		orientation = <0>;
+
+		port {
+			cam_front_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <200000000 400000000 748800000>;
+				remote-endpoint = <&cam_front_csiphy2_ep>;
+			};
+		};
+	};
+};
+
+&camss {
+	ports {
+		port@2 {
+			reg = <2>;
+
+			cam_front_csiphy2_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				remote-endpoint = <&cam_front_ep>;
+			};
+		};
+	};
+};
+
+#include "imx319.dtsi"
+
+&camss {
+	memory-region = <&camss_iova_resv>;
+	memory-region-names = "ife-iova";
+};
+
+#include "s5k3m5-samurai.dtsi"
+
+#include "s5kgw1-samurai.dtsi"
+
+/* Shared camera I/O must also be powered for autonomous lens/EEPROM traffic. */
+&cci0 {
+	vddio-supply = <&vreg_l1c_1p8>;
+};
+
+&cci1 {
+	vddio-supply = <&vreg_l1c_1p8>;
+};

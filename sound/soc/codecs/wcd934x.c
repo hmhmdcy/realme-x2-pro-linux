@@ -551,6 +551,7 @@ struct wcd934x_codec {
 	struct wcd_mbhc_config mbhc_cfg;
 	struct wcd_mbhc_intr intr_ids;
 	bool mbhc_started;
+	struct snd_soc_jack *mbhc_jack;
 	struct mutex micb_lock;
 	u32 micb_ref[WCD934X_MAX_MICBIAS];
 	u32 pullup_ref[WCD934X_MAX_MICBIAS];
@@ -1355,7 +1356,7 @@ static int __wcd934x_cdc_mclk_enable(struct wcd934x_codec *wcd, bool enable)
 		}
 		ret = wcd934x_enable_ana_bias_and_sysclk(wcd);
 	} else {
-		int val;
+		int val = 0;
 
 		regmap_read(wcd->regmap, WCD934X_CDC_CLK_RST_CTRL_SWR_CONTROL,
 			    &val);
@@ -1403,8 +1404,12 @@ static int wcd934x_get_version(struct wcd934x_codec *wcd)
 	if (ret)
 		return ret;
 
-	regmap_read(regmap, WCD934X_CHIP_TIER_CTRL_EFUSE_VAL_OUT14, &val1);
-	regmap_read(regmap, WCD934X_CHIP_TIER_CTRL_EFUSE_VAL_OUT15, &val2);
+	ret = regmap_read(regmap, WCD934X_CHIP_TIER_CTRL_EFUSE_VAL_OUT14, &val1);
+	if (ret)
+		return ret;
+	ret = regmap_read(regmap, WCD934X_CHIP_TIER_CTRL_EFUSE_VAL_OUT15, &val2);
+	if (ret)
+		return ret;
 
 	version_mask |= (!!((u8)val1 & 0x80)) << DSD_DISABLED_MASK;
 	version_mask |= (!!((u8)val2 & 0x01)) << SLNQ_DISABLED_MASK;
@@ -1430,34 +1435,45 @@ static int wcd934x_get_version(struct wcd934x_codec *wcd)
 	return 0;
 }
 
-static void wcd934x_enable_efuse_sensing(struct wcd934x_codec *wcd)
+static int wcd934x_enable_efuse_sensing(struct wcd934x_codec *wcd)
 {
-	int rc, val;
+	int ret, val;
 
-	__wcd934x_cdc_mclk_enable(wcd, true);
+	ret = __wcd934x_cdc_mclk_enable(wcd, true);
+	if (ret)
+		return ret;
 
-	regmap_update_bits(wcd->regmap,
-			   WCD934X_CHIP_TIER_CTRL_EFUSE_CTL,
-			   WCD934X_EFUSE_SENSE_STATE_MASK,
-			   WCD934X_EFUSE_SENSE_STATE_DEF);
-	regmap_update_bits(wcd->regmap,
-			   WCD934X_CHIP_TIER_CTRL_EFUSE_CTL,
-			   WCD934X_EFUSE_SENSE_EN_MASK,
-			   WCD934X_EFUSE_SENSE_ENABLE);
+	ret = regmap_update_bits(wcd->regmap,
+				 WCD934X_CHIP_TIER_CTRL_EFUSE_CTL,
+				 WCD934X_EFUSE_SENSE_STATE_MASK,
+				 WCD934X_EFUSE_SENSE_STATE_DEF);
+	if (ret)
+		goto disable_mclk;
+	ret = regmap_update_bits(wcd->regmap,
+				 WCD934X_CHIP_TIER_CTRL_EFUSE_CTL,
+				 WCD934X_EFUSE_SENSE_EN_MASK,
+				 WCD934X_EFUSE_SENSE_ENABLE);
+	if (ret)
+		goto disable_mclk;
 	/*
 	 * 5ms sleep required after enabling efuse control
 	 * before checking the status.
 	 */
 	usleep_range(5000, 5500);
-	wcd934x_set_sido_input_src(wcd, SIDO_SOURCE_RCO_BG);
+	ret = wcd934x_set_sido_input_src(wcd, SIDO_SOURCE_RCO_BG);
+	if (ret)
+		goto disable_mclk;
 
-	rc = regmap_read(wcd->regmap,
-			 WCD934X_CHIP_TIER_CTRL_EFUSE_STATUS, &val);
-	if (rc || (!(val & 0x01)))
-		WARN(1, "%s: Efuse sense is not complete val=%x, ret=%d\n",
-		     __func__, val, rc);
+	ret = regmap_read(wcd->regmap,
+			  WCD934X_CHIP_TIER_CTRL_EFUSE_STATUS, &val);
+	if (!ret && !(val & 0x01)) {
+		dev_err(wcd->dev, "Efuse sense is not complete: val=%x\n", val);
+		ret = -EIO;
+	}
 
+disable_mclk:
 	__wcd934x_cdc_mclk_enable(wcd, false);
+	return ret;
 }
 
 static int wcd934x_swrm_clock(struct wcd934x_codec *wcd, bool enable)
@@ -1864,36 +1880,135 @@ static int wcd934x_hw_free(struct snd_pcm_substream *substream,
 	return 0;
 }
 
-static int wcd934x_trigger(struct snd_pcm_substream *substream, int cmd,
-			   struct snd_soc_dai *dai)
+/* Stream port masks have TX before RX, interrupt registers have RX first. */
+static int wcd934x_slim_port_interrupts(struct wcd934x_codec *wcd,
+					struct wcd_slim_codec_dai_data *dai,
+					bool enable)
 {
-	struct wcd_slim_codec_dai_data *dai_data;
-	struct wcd934x_codec *wcd;
-	struct slim_stream_config *cfg;
+	u32 ports = (dai->sconfig.port_mask >> 16) |
+		    (dai->sconfig.port_mask << 16);
+	unsigned int mask, i;
+	int ret, err = 0;
 
-	wcd = snd_soc_component_get_drvdata(dai->component);
+	for (i = 0; i < 4; i++) {
+		mask = (ports >> (8 * i)) & 0xff;
+		if (!mask)
+			continue;
+		ret = regmap_update_bits(wcd->if_regmap,
+					 WCD934X_SLIM_PGD_PORT_INT_EN0 + i,
+					 mask, enable ? mask : 0);
+		if (ret && !err)
+			err = ret;
+	}
 
-	dai_data = &wcd->dai[dai->id];
+	return err;
+}
+
+static int wcd934x_slim_port_clear(struct wcd934x_codec *wcd,
+				   struct wcd_slim_codec_dai_data *dai)
+{
+	u32 ports = (dai->sconfig.port_mask >> 16) |
+		    (dai->sconfig.port_mask << 16);
+	unsigned int mask, i;
+	int ret, err = 0;
+
+	for (i = 0; i < 4; i++) {
+		mask = (ports >> (8 * i)) & 0xff;
+		if (!mask)
+			continue;
+		ret = regmap_write(wcd->if_regmap,
+				   WCD934X_SLIM_PGD_PORT_INT_CLR_RX_0 + i,
+				   mask);
+		if (ret && !err)
+			err = ret;
+	}
+
+	return err;
+}
+
+static int wcd934x_slim_stop(struct wcd934x_codec *wcd,
+			     struct wcd_slim_codec_dai_data *dai_data)
+{
+	int ret = 0, cleanup;
+
+	if (!slim_device_is_online(wcd->sdev))
+		goto abort;
+
+	/* Mask FIFO/port-closed events before disconnecting a live bus. */
+	ret = wcd934x_slim_port_interrupts(wcd, dai_data, false);
+	if (ret == -ENOTCONN && !slim_device_is_online(wcd->sdev))
+		goto abort;
+	cleanup = slim_stream_disable(dai_data->sruntime);
+	if (!ret)
+		ret = cleanup;
+	if (cleanup == -ENOTCONN && !slim_device_is_online(wcd->sdev))
+		goto abort;
+	cleanup = slim_stream_unprepare(dai_data->sruntime);
+	if (!ret)
+		ret = cleanup;
+	cleanup = wcd934x_slim_port_clear(wcd, dai_data);
+	if (!ret)
+		ret = cleanup;
+	if (cleanup == -ENOTCONN && !slim_device_is_online(wcd->sdev))
+		goto abort;
+
+	return ret;
+abort:
+	cleanup = slim_stream_abort(dai_data->sruntime);
+	return ret && ret != -ENOTCONN ? ret : cleanup;
+}
+
+static int wcd934x_trigger(struct snd_pcm_substream *substream, int cmd,
+                          struct snd_soc_dai *dai)
+{
+	struct wcd934x_codec *wcd = snd_soc_component_get_drvdata(dai->component);
+	struct wcd_slim_codec_dai_data *dai_data = &wcd->dai[dai->id];
+	int ret = 0;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		cfg = &dai_data->sconfig;
-		slim_stream_prepare(dai_data->sruntime, cfg);
-		slim_stream_enable(dai_data->sruntime);
+		if (!slim_device_is_online(wcd->sdev)) {
+			ret = -ENOTCONN;
+			break;
+		}
+		ret = wcd934x_slim_port_interrupts(wcd, dai_data, false);
+		if (ret)
+			break;
+		ret = wcd934x_slim_port_clear(wcd, dai_data);
+		if (ret)
+			break;
+		ret = slim_stream_prepare(dai_data->sruntime, &dai_data->sconfig);
+		if (ret)
+			break;
+		ret = slim_stream_enable(dai_data->sruntime);
+		if (ret) {
+			slim_stream_unprepare(dai_data->sruntime);
+			wcd934x_slim_port_clear(wcd, dai_data);
+			break;
+		}
+		ret = wcd934x_slim_port_interrupts(wcd, dai_data, true);
+		if (ret) {
+			wcd934x_slim_port_interrupts(wcd, dai_data, false);
+			slim_stream_disable(dai_data->sruntime);
+			slim_stream_unprepare(dai_data->sruntime);
+			wcd934x_slim_port_clear(wcd, dai_data);
+		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		slim_stream_disable(dai_data->sruntime);
-		slim_stream_unprepare(dai_data->sruntime);
+		ret = wcd934x_slim_stop(wcd, dai_data);
 		break;
 	default:
-		break;
+		return -EINVAL;
 	}
-
-	return 0;
+	if (of_machine_is_compatible("realme,samurai"))
+		dev_info(dai->dev, "samurai slim trigger dai=%d command=%d channels=%u rate=%u ret=%d\n",
+			 dai->id, cmd, dai_data->sconfig.ch_count,
+			 dai_data->sconfig.rate, ret);
+	return ret;
 }
 
 static int wcd934x_set_channel_map(struct snd_soc_dai *dai,
@@ -2124,7 +2239,7 @@ static const struct clk_ops swclk_gate_ops = {
 
 };
 
-static struct clk *wcd934x_register_mclk_output(struct wcd934x_codec *wcd)
+static int wcd934x_register_mclk_output(struct wcd934x_codec *wcd)
 {
 	struct clk *parent = wcd->extclk;
 	struct device *dev = wcd->dev;
@@ -2136,7 +2251,7 @@ static struct clk *wcd934x_register_mclk_output(struct wcd934x_codec *wcd)
 	int ret;
 
 	if (of_property_read_u32(np, "clock-frequency", &wcd->rate))
-		return NULL;
+		return 0;
 
 	parent_clk_name = __clk_get_name(parent);
 
@@ -2150,15 +2265,15 @@ static struct clk *wcd934x_register_mclk_output(struct wcd934x_codec *wcd)
 	wcd->hw.init = &init;
 
 	hw = &wcd->hw;
-	ret = devm_clk_hw_register(wcd->dev->parent, hw);
+	ret = devm_clk_hw_register(dev, hw);
 	if (ret)
-		return ERR_PTR(ret);
+		return ret;
 
 	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
 	if (ret)
-		return ERR_PTR(ret);
+		return ret;
 
-	return NULL;
+	return 0;
 }
 
 static int wcd934x_init_dmic(struct snd_soc_component *comp)
@@ -2171,14 +2286,24 @@ static int wcd934x_init_dmic(struct snd_soc_component *comp)
 	if (ret)
 		return ret;
 
-	snd_soc_component_update_bits(comp, WCD934X_ANA_MICB1,
-				      WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[0]);
-	snd_soc_component_update_bits(comp, WCD934X_ANA_MICB2,
-				      WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[1]);
-	snd_soc_component_update_bits(comp, WCD934X_ANA_MICB3,
-				      WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[2]);
-	snd_soc_component_update_bits(comp, WCD934X_ANA_MICB4,
-				      WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[3]);
+	wcd->mbhc_cfg.micb_mv = wcd->common.micb_mv[MIC_BIAS_2 - 1];
+
+	ret = snd_soc_component_update_bits(comp, WCD934X_ANA_MICB1,
+					    WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[0]);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(comp, WCD934X_ANA_MICB2,
+					    WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[1]);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(comp, WCD934X_ANA_MICB3,
+					    WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[2]);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(comp, WCD934X_ANA_MICB4,
+					    WCD934X_MICB_VAL_MASK, wcd->common.micb_vout[3]);
+	if (ret < 0)
+		return ret;
 
 	if (wcd->rate == WCD934X_MCLK_CLK_9P6MHZ)
 		def_dmic_rate = WCD9XXX_DMIC_SAMPLE_RATE_4P8MHZ;
@@ -2188,33 +2313,45 @@ static int wcd934x_init_dmic(struct snd_soc_component *comp)
 	wcd->dmic_sample_rate = def_dmic_rate;
 
 	dmic_clk_drv = 0;
-	snd_soc_component_update_bits(comp, WCD934X_TEST_DEBUG_PAD_DRVCTL_0,
-				      0x0C, dmic_clk_drv << 2);
+	ret = snd_soc_component_update_bits(comp, WCD934X_TEST_DEBUG_PAD_DRVCTL_0,
+					    0x0C, dmic_clk_drv << 2);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
 
-static void wcd934x_hw_init(struct wcd934x_codec *wcd)
+static int wcd934x_hw_init(struct wcd934x_codec *wcd)
 {
 	struct regmap *rm = wcd->regmap;
+	int ret;
 
 	/* set SPKR rate to FS_2P4_3P072 */
-	regmap_update_bits(rm, WCD934X_CDC_RX7_RX_PATH_CFG1, 0x08, 0x08);
-	regmap_update_bits(rm, WCD934X_CDC_RX8_RX_PATH_CFG1, 0x08, 0x08);
+	ret = regmap_update_bits(rm, WCD934X_CDC_RX7_RX_PATH_CFG1, 0x08, 0x08);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(rm, WCD934X_CDC_RX8_RX_PATH_CFG1, 0x08, 0x08);
+	if (ret)
+		return ret;
 
 	/* Take DMICs out of reset */
-	regmap_update_bits(rm, WCD934X_CPE_SS_DMIC_CFG, 0x80, 0x00);
+	return regmap_update_bits(rm, WCD934X_CPE_SS_DMIC_CFG, 0x80, 0x00);
 }
 
 static int wcd934x_comp_init(struct snd_soc_component *component)
 {
 	struct wcd934x_codec *wcd = dev_get_drvdata(component->dev);
 
-	wcd934x_hw_init(wcd);
-	wcd934x_enable_efuse_sensing(wcd);
-	wcd934x_get_version(wcd);
+	int ret;
 
-	return 0;
+	ret = wcd934x_hw_init(wcd);
+	if (ret)
+		return ret;
+	ret = wcd934x_enable_efuse_sensing(wcd);
+	if (ret)
+		return ret;
+
+	return wcd934x_get_version(wcd);
 }
 
 static irqreturn_t wcd934x_slim_irq_handler(int irq, void *data)
@@ -2229,7 +2366,8 @@ static irqreturn_t wcd934x_slim_irq_handler(int irq, void *data)
 
 	for (i = WCD934X_SLIM_PGD_PORT_INT_STATUS_RX_0, j = 0;
 	     i <= WCD934X_SLIM_PGD_PORT_INT_STATUS_TX_1; i++, j++) {
-		regmap_read(wcd->if_regmap, i, &val);
+		if (regmap_read(wcd->if_regmap, i, &val))
+			return IRQ_NONE;
 		status |= ((u32)val << (8 * j));
 	}
 
@@ -2242,8 +2380,9 @@ static irqreturn_t wcd934x_slim_irq_handler(int irq, void *data)
 			port_id = j - 16;
 		}
 
-		regmap_read(wcd->if_regmap,
-			    WCD934X_SLIM_PGD_PORT_INT_RX_SOURCE0 + j, &val);
+		if (regmap_read(wcd->if_regmap,
+				WCD934X_SLIM_PGD_PORT_INT_RX_SOURCE0 + j, &val))
+			continue;
 		if (val) {
 			if (!tx)
 				reg = WCD934X_SLIM_PGD_PORT_INT_EN0 +
@@ -2251,7 +2390,10 @@ static irqreturn_t wcd934x_slim_irq_handler(int irq, void *data)
 			else
 				reg = WCD934X_SLIM_PGD_PORT_INT_TX_EN0 +
 					(port_id / 8);
-			regmap_read(wcd->if_regmap, reg, &int_val);
+			if (regmap_read(wcd->if_regmap, reg, &int_val))
+				continue;
+			if (!(int_val & BIT(port_id % 8)))
+				goto clear;
 		}
 
 		if (val & WCD934X_SLIM_IRQ_OVERFLOW)
@@ -2272,13 +2414,8 @@ static irqreturn_t wcd934x_slim_irq_handler(int irq, void *data)
 			else
 				reg = WCD934X_SLIM_PGD_PORT_INT_TX_EN0 +
 					(port_id / 8);
-			regmap_read(
-				wcd->if_regmap, reg, &int_val);
-			if (int_val & (1 << (port_id % 8))) {
-				int_val = int_val ^ (1 << (port_id % 8));
-				regmap_write(wcd->if_regmap,
-					     reg, int_val);
-			}
+			regmap_update_bits(wcd->if_regmap, reg,
+					   BIT(port_id % 8), 0);
 		}
 
 		if (val & WCD934X_SLIM_IRQ_PORT_CLOSED)
@@ -2286,6 +2423,7 @@ static irqreturn_t wcd934x_slim_irq_handler(int irq, void *data)
 					    "Port Closed %s port %d, value %x\n",
 					    (tx ? "TX" : "RX"), port_id, val);
 
+clear:
 		regmap_write(wcd->if_regmap,
 			     WCD934X_SLIM_PGD_PORT_INT_CLR_RX_0 + (j / 8),
 				BIT(j % 8));
@@ -2939,6 +3077,7 @@ static int wcd934x_mbhc_init(struct snd_soc_component *component)
 	struct wcd934x_ddata *data = dev_get_drvdata(component->dev->parent);
 	struct wcd934x_codec *wcd = snd_soc_component_get_drvdata(component);
 	struct wcd_mbhc_intr *intr_ids = &wcd->intr_ids;
+	int ret;
 
 	intr_ids->mbhc_sw_intr = regmap_irq_get_virq(data->irq_data,
 						     WCD934X_IRQ_MBHC_SW_DET);
@@ -2957,16 +3096,23 @@ static int wcd934x_mbhc_init(struct snd_soc_component *component)
 
 	wcd->mbhc = wcd_mbhc_init(component, &mbhc_cb, intr_ids, wcd_mbhc_fields, true);
 	if (IS_ERR(wcd->mbhc)) {
+		ret = PTR_ERR(wcd->mbhc);
+
 		wcd->mbhc = NULL;
-		return -EINVAL;
+		return ret;
 	}
 
-	snd_soc_add_component_controls(component, impedance_detect_controls,
-				       ARRAY_SIZE(impedance_detect_controls));
-	snd_soc_add_component_controls(component, hph_type_detect_controls,
-				       ARRAY_SIZE(hph_type_detect_controls));
+	ret = snd_soc_add_component_controls(component, impedance_detect_controls,
+					     ARRAY_SIZE(impedance_detect_controls));
+	if (!ret)
+		ret = snd_soc_add_component_controls(component, hph_type_detect_controls,
+						     ARRAY_SIZE(hph_type_detect_controls));
+	if (ret) {
+		wcd_mbhc_deinit(wcd->mbhc);
+		wcd->mbhc = NULL;
+	}
 
-	return 0;
+	return ret;
 }
 
 static void wcd934x_mbhc_deinit(struct snd_soc_component *component)
@@ -2977,6 +3123,9 @@ static void wcd934x_mbhc_deinit(struct snd_soc_component *component)
 		return;
 
 	wcd_mbhc_deinit(wcd->mbhc);
+	wcd->mbhc = NULL;
+	wcd->mbhc_started = false;
+	wcd->mbhc_jack = NULL;
 }
 
 static int wcd934x_comp_probe(struct snd_soc_component *component)
@@ -2987,6 +3136,18 @@ static int wcd934x_comp_probe(struct snd_soc_component *component)
 	snd_soc_component_init_regmap(component, wcd->regmap);
 	wcd->component = component;
 
+	if (READ_ONCE(wcd->sdev->status) != SLIM_DEVICE_STATUS_UP)
+		return -EPROBE_DEFER;
+
+	ret = wcd934x_comp_init(component);
+	if (ret) {
+		if (ret == -EREMOTEIO || ret == -ENOTCONN ||
+		    ret == -EHOSTDOWN || ret == -EAGAIN)
+			ret = -EPROBE_DEFER;
+		return dev_err_probe(component->dev, ret,
+				     "Failed to initialize WCD934x hardware\n");
+	}
+
 	/* Class-H Init*/
 	wcd->clsh_ctrl = wcd_clsh_ctrl_alloc(component, wcd->version);
 	if (IS_ERR(wcd->clsh_ctrl))
@@ -2995,8 +3156,6 @@ static int wcd934x_comp_probe(struct snd_soc_component *component)
 	/* Default HPH Mode to Class-H Low HiFi */
 	wcd->hph_mode = CLS_H_LOHIFI;
 
-	wcd934x_comp_init(component);
-
 	for (i = 0; i < NUM_CODEC_DAIS; i++)
 		INIT_LIST_HEAD(&wcd->dai[i].slim_ch_list);
 
@@ -3004,11 +3163,15 @@ static int wcd934x_comp_probe(struct snd_soc_component *component)
 	ret = wcd934x_init_dmic(component);
 	if (ret) {
 		dev_err(component->dev, "Failed to Initialize micbias\n");
+		wcd_clsh_ctrl_free(wcd->clsh_ctrl);
 		return ret;
 	}
 
-	if (wcd934x_mbhc_init(component))
-		dev_err(component->dev, "Failed to Initialize MBHC\n");
+	ret = wcd934x_mbhc_init(component);
+	if (ret) {
+		wcd_clsh_ctrl_free(wcd->clsh_ctrl);
+		return dev_err_probe(component->dev, ret, "Failed to initialize MBHC\n");
+	}
 
 	return 0;
 }
@@ -4071,47 +4234,6 @@ static const struct snd_kcontrol_new wcd934x_snd_controls[] = {
 		       wcd934x_compander_get, wcd934x_compander_set),
 };
 
-static void wcd934x_codec_enable_int_port(struct wcd_slim_codec_dai_data *dai,
-					  struct snd_soc_component *component)
-{
-	int port_num = 0;
-	unsigned short reg = 0;
-	unsigned int val = 0;
-	struct wcd934x_codec *wcd = dev_get_drvdata(component->dev);
-	struct wcd934x_slim_ch *ch;
-
-	list_for_each_entry(ch, &dai->slim_ch_list, list) {
-		if (ch->port >= WCD934X_RX_START) {
-			port_num = ch->port - WCD934X_RX_START;
-			reg = WCD934X_SLIM_PGD_PORT_INT_EN0 + (port_num / 8);
-		} else {
-			port_num = ch->port;
-			reg = WCD934X_SLIM_PGD_PORT_INT_TX_EN0 + (port_num / 8);
-		}
-
-		regmap_read(wcd->if_regmap, reg, &val);
-		if (!(val & BIT(port_num % 8)))
-			regmap_write(wcd->if_regmap, reg,
-				     val | BIT(port_num % 8));
-	}
-}
-
-static int wcd934x_codec_enable_slim(struct snd_soc_dapm_widget *w,
-				     struct snd_kcontrol *kc, int event)
-{
-	struct snd_soc_component *comp = snd_soc_dapm_to_component(w->dapm);
-	struct wcd934x_codec *wcd = snd_soc_component_get_drvdata(comp);
-	struct wcd_slim_codec_dai_data *dai = &wcd->dai[w->shift];
-
-	switch (event) {
-	case SND_SOC_DAPM_POST_PMU:
-		wcd934x_codec_enable_int_port(dai, comp);
-		break;
-	}
-
-	return 0;
-}
-
 static void wcd934x_codec_hd2_control(struct snd_soc_component *component,
 				      u16 interp_idx, int event)
 {
@@ -5123,18 +5245,14 @@ static const struct snd_soc_dapm_widget wcd934x_dapm_widgets[] = {
 	SND_SOC_DAPM_OUTPUT("WDMA3_OUT"),
 	SND_SOC_DAPM_OUTPUT("MAD_CPE_OUT1"),
 	SND_SOC_DAPM_OUTPUT("MAD_CPE_OUT2"),
-	SND_SOC_DAPM_AIF_IN_E("AIF1 PB", "AIF1 Playback", 0, SND_SOC_NOPM,
-			      AIF1_PB, 0, wcd934x_codec_enable_slim,
-			      SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
-	SND_SOC_DAPM_AIF_IN_E("AIF2 PB", "AIF2 Playback", 0, SND_SOC_NOPM,
-			      AIF2_PB, 0, wcd934x_codec_enable_slim,
-			      SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
-	SND_SOC_DAPM_AIF_IN_E("AIF3 PB", "AIF3 Playback", 0, SND_SOC_NOPM,
-			      AIF3_PB, 0, wcd934x_codec_enable_slim,
-			      SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
-	SND_SOC_DAPM_AIF_IN_E("AIF4 PB", "AIF4 Playback", 0, SND_SOC_NOPM,
-			      AIF4_PB, 0, wcd934x_codec_enable_slim,
-			      SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_AIF_IN("AIF1 PB", "AIF1 Playback", 0, SND_SOC_NOPM,
+			    AIF1_PB, 0),
+	SND_SOC_DAPM_AIF_IN("AIF2 PB", "AIF2 Playback", 0, SND_SOC_NOPM,
+			    AIF2_PB, 0),
+	SND_SOC_DAPM_AIF_IN("AIF3 PB", "AIF3 Playback", 0, SND_SOC_NOPM,
+			    AIF3_PB, 0),
+	SND_SOC_DAPM_AIF_IN("AIF4 PB", "AIF4 Playback", 0, SND_SOC_NOPM,
+			    AIF4_PB, 0),
 
 	SND_SOC_DAPM_MUX("SLIM RX0 MUX", SND_SOC_NOPM, WCD934X_RX0, 0,
 			 &slim_rx_mux[WCD934X_RX0]),
@@ -5458,15 +5576,12 @@ static const struct snd_soc_dapm_widget wcd934x_dapm_widgets[] = {
 	SND_SOC_DAPM_INPUT("DMIC4 Pin"),
 	SND_SOC_DAPM_INPUT("DMIC5 Pin"),
 
-	SND_SOC_DAPM_AIF_OUT_E("AIF1 CAP", "AIF1 Capture", 0, SND_SOC_NOPM,
-			       AIF1_CAP, 0, wcd934x_codec_enable_slim,
-			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
-	SND_SOC_DAPM_AIF_OUT_E("AIF2 CAP", "AIF2 Capture", 0, SND_SOC_NOPM,
-			       AIF2_CAP, 0, wcd934x_codec_enable_slim,
-			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
-	SND_SOC_DAPM_AIF_OUT_E("AIF3 CAP", "AIF3 Capture", 0, SND_SOC_NOPM,
-			       AIF3_CAP, 0, wcd934x_codec_enable_slim,
-			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_AIF_OUT("AIF1 CAP", "AIF1 Capture", 0, SND_SOC_NOPM,
+			     AIF1_CAP, 0),
+	SND_SOC_DAPM_AIF_OUT("AIF2 CAP", "AIF2 Capture", 0, SND_SOC_NOPM,
+			     AIF2_CAP, 0),
+	SND_SOC_DAPM_AIF_OUT("AIF3 CAP", "AIF3 Capture", 0, SND_SOC_NOPM,
+			     AIF3_CAP, 0),
 
 	SND_SOC_DAPM_MIXER("SLIM TX0", SND_SOC_NOPM, 0, 0, NULL, 0),
 	SND_SOC_DAPM_MIXER("SLIM TX1", SND_SOC_NOPM, 0, 0, NULL, 0),
@@ -5759,12 +5874,21 @@ static int wcd934x_codec_set_jack(struct snd_soc_component *comp,
 	if (!wcd->mbhc)
 		return -ENOTSUPP;
 
-	if (jack && !wcd->mbhc_started) {
+	if (jack) {
+		if (wcd->mbhc_started)
+			return wcd->mbhc_jack == jack ? 0 : -EBUSY;
 		ret = wcd_mbhc_start(wcd->mbhc, &wcd->mbhc_cfg, jack);
+		if (ret)
+			return ret;
+		wcd->mbhc_jack = jack;
 		wcd->mbhc_started = true;
+		if (of_machine_is_compatible("realme,samurai"))
+			dev_info(comp->dev, "samurai MBHC started: micbias=%u mV\n",
+				 wcd->mbhc_cfg.micb_mv);
 	} else if (wcd->mbhc_started) {
 		wcd_mbhc_stop(wcd->mbhc);
 		wcd->mbhc_started = false;
+		wcd->mbhc_jack = NULL;
 	}
 
 	return ret;
@@ -5791,29 +5915,60 @@ static void wcd934x_put_device_action(void *data)
 	put_device(dev);
 }
 
+static void wcd934x_regmap_exit_action(void *data)
+{
+	regmap_exit(data);
+}
+
+static int wcd934x_init_slim_interface(struct wcd934x_codec *wcd,
+				       struct device_node *np)
+{
+	struct device *dev = wcd->dev;
+	int ret;
+
+	wcd->sidev = of_slim_get_device(wcd->sdev->ctrl, np);
+	if (!wcd->sidev)
+		return dev_err_probe(dev, -EINVAL, "Unable to get SLIM Interface device\n");
+
+	/* Keep the interface alive until its codec-owned regmap is released. */
+	ret = devm_add_action_or_reset(dev, wcd934x_put_device_action,
+				       &wcd->sidev->dev);
+	if (ret)
+		return ret;
+
+	ret = slim_get_logical_addr(wcd->sidev);
+	if (ret)
+		return dev_err_probe(dev, ret, "Unable to get SLIM Interface address\n");
+
+	wcd->if_regmap = regmap_init_slimbus(wcd->sidev,
+					     &wcd934x_ifc_regmap_config);
+	if (IS_ERR(wcd->if_regmap))
+		return dev_err_probe(dev, PTR_ERR(wcd->if_regmap),
+				     "Failed to allocate ifc register map\n");
+
+	ret = devm_add_action_or_reset(dev, wcd934x_regmap_exit_action,
+				       wcd->if_regmap);
+	if (ret)
+		wcd->if_regmap = NULL;
+
+	return ret;
+}
+
 static int wcd934x_codec_parse_data(struct wcd934x_codec *wcd)
 {
 	struct device *dev = &wcd->sdev->dev;
 	struct wcd_mbhc_config *cfg = &wcd->mbhc_cfg;
 	struct device_node *ifc_dev_np;
+	int ret;
 
 	ifc_dev_np = of_parse_phandle(dev->of_node, "slim-ifc-dev", 0);
 	if (!ifc_dev_np)
 		return dev_err_probe(dev, -EINVAL, "No Interface device found\n");
 
-	wcd->sidev = of_slim_get_device(wcd->sdev->ctrl, ifc_dev_np);
+	ret = wcd934x_init_slim_interface(wcd, ifc_dev_np);
 	of_node_put(ifc_dev_np);
-	if (!wcd->sidev)
-		return dev_err_probe(dev, -EINVAL, "Unable to get SLIM Interface device\n");
-
-	slim_get_logical_addr(wcd->sidev);
-	wcd->if_regmap = devm_regmap_init_slimbus(wcd->sidev,
-				  &wcd934x_ifc_regmap_config);
-	if (IS_ERR(wcd->if_regmap)) {
-		put_device(&wcd->sidev->dev);
-		return dev_err_probe(dev, PTR_ERR(wcd->if_regmap),
-				     "Failed to allocate ifc register map\n");
-	}
+	if (ret)
+		return ret;
 
 	of_property_read_u32(dev->parent->of_node, "qcom,dmic-sample-rate",
 			     &wcd->dmic_sample_rate);
@@ -5822,7 +5977,6 @@ static int wcd934x_codec_parse_data(struct wcd934x_codec *wcd)
 	cfg->anc_micbias = MIC_BIAS_2;
 	cfg->v_hs_max = WCD_MBHC_HS_V_MAX;
 	cfg->num_btn = WCD934X_MBHC_MAX_BUTTONS;
-	cfg->micb_mv = wcd->common.micb_mv[1];
 	cfg->linein_th = 5000;
 	cfg->hs_thr = 1700;
 	cfg->hph_thr = 50;
@@ -5856,10 +6010,6 @@ static int wcd934x_codec_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = devm_add_action_or_reset(dev, wcd934x_put_device_action, &wcd->sidev->dev);
-	if (ret)
-		return ret;
-
 	/* set default rate 9P6MHz */
 	regmap_update_bits(wcd->regmap, WCD934X_CODEC_RPM_CLK_MCLK_CFG,
 			   WCD934X_CODEC_RPM_CLK_MCLK_CFG_MCLK_MASK,
@@ -5878,7 +6028,9 @@ static int wcd934x_codec_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to request slimbus irq\n");
 
-	wcd934x_register_mclk_output(wcd);
+	ret = wcd934x_register_mclk_output(wcd);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to register MCLK output\n");
 	platform_set_drvdata(pdev, wcd);
 
 	return devm_snd_soc_register_component(dev, &wcd934x_component_drv,

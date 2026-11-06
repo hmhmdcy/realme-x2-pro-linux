@@ -5,6 +5,11 @@
 
 #include "dsi.h"
 
+int msm_dsi_quiesce_firmware(struct msm_dsi *msm_dsi)
+{
+	return msm_dsi_host_quiesce_firmware(msm_dsi->host);
+}
+
 bool msm_dsi_is_cmd_mode(struct msm_dsi *msm_dsi)
 {
 	unsigned long host_flags = msm_dsi_host_get_mode_flags(msm_dsi->host);

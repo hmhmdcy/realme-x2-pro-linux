@@ -1475,6 +1475,8 @@ void drm_bridge_hpd_notify(struct drm_bridge *bridge,
 
 #ifdef CONFIG_DRM_PANEL_BRIDGE
 bool drm_bridge_is_panel(const struct drm_bridge *bridge);
+bool drm_panel_bridge_needs_first_frame(struct drm_bridge *bridge);
+void drm_panel_bridge_first_frame_done(struct drm_bridge *bridge);
 struct drm_bridge *drm_panel_bridge_add(struct drm_panel *panel);
 struct drm_bridge *drm_panel_bridge_add_typed(struct drm_panel *panel,
 					      u32 connector_type);
@@ -1493,6 +1495,15 @@ struct drm_connector *drm_panel_bridge_connector(struct drm_bridge *bridge);
 static inline bool drm_bridge_is_panel(const struct drm_bridge *bridge)
 {
 	return false;
+}
+
+static inline bool drm_panel_bridge_needs_first_frame(struct drm_bridge *bridge)
+{
+	return false;
+}
+
+static inline void drm_panel_bridge_first_frame_done(struct drm_bridge *bridge)
+{
 }
 
 static inline int drm_panel_bridge_set_orientation(struct drm_connector *connector,

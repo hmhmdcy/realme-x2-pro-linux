@@ -283,6 +283,19 @@ struct drm_panel {
 	bool enabled;
 
 	/**
+	 * @delay_backlight_until_first_frame:
+	 * Command panels requiring a complete frame in GRAM before illumination.
+	 * The display driver must call drm_panel_first_frame_done() after TX done.
+	 */
+	bool delay_backlight_until_first_frame;
+
+	/**
+	 * @backlight_ready: Whether positive brightness updates may reach the panel.
+	 * Updated by the panel helpers; drivers read it with READ_ONCE().
+	 */
+	bool backlight_ready;
+
+	/**
 	 * @container: Pointer to the private driver struct embedding this
 	 * @struct drm_panel.
 	 */
@@ -331,6 +344,7 @@ void drm_panel_prepare(struct drm_panel *panel);
 void drm_panel_unprepare(struct drm_panel *panel);
 
 void drm_panel_enable(struct drm_panel *panel);
+void drm_panel_first_frame_done(struct drm_panel *panel);
 void drm_panel_disable(struct drm_panel *panel);
 
 int drm_panel_get_modes(struct drm_panel *panel, struct drm_connector *connector);

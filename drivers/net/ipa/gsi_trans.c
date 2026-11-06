@@ -619,7 +619,14 @@ void gsi_trans_commit_wait(struct gsi_trans *trans)
 
 	__gsi_trans_commit(trans, true);
 
-	wait_for_completion(&trans->completion);
+	/* Hold our reference until completion or a bounded timeout. The
+	 * completion path retains its own reference after we time out.
+	 */
+	if (!wait_for_completion_timeout(&trans->completion,
+					 msecs_to_jiffies(1000)))
+		dev_err(trans->gsi->dev,
+			"channel %u: transaction did not complete in 1000ms\n",
+			trans->channel_id);
 
 out_trans_free:
 	gsi_trans_free(trans);

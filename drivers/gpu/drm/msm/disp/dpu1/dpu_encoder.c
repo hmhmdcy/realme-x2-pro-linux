@@ -199,6 +199,8 @@ struct dpu_encoder_virt {
 
 	atomic_t frame_done_timeout_ms;
 	atomic_t frame_done_timeout_cnt;
+	/* Protected with frame_busy_mask by enc_spinlock. */
+	unsigned long frame_done_deadline;
 	struct timer_list frame_done_timer;
 
 	struct msm_display_info disp_info;
@@ -1421,8 +1423,13 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
 
 
 	/* after phys waits for frame-done, should be no more frames pending */
-	if (atomic_xchg(&dpu_enc->frame_done_timeout_ms, 0)) {
-		DPU_ERROR("enc%d timeout pending\n", drm_enc->base.id);
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&dpu_enc->enc_spinlock, flags);
+		atomic_set(&dpu_enc->frame_done_timeout_ms, 0);
+		dpu_enc->frame_done_deadline = 0;
+		spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
 		timer_delete_sync(&dpu_enc->frame_done_timer);
 	}
 
@@ -1566,25 +1573,26 @@ void dpu_encoder_frame_done_callback(
 		struct dpu_encoder_phys *ready_phys, u32 event)
 {
 	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+	unsigned long flags;
 	unsigned int i;
+	bool completed = false;
 
 	if (event & (DPU_ENCODER_FRAME_EVENT_DONE
 			| DPU_ENCODER_FRAME_EVENT_ERROR
 			| DPU_ENCODER_FRAME_EVENT_PANEL_DEAD)) {
-
+		/* Serialize clearing the last busy bit and disarming the timer
+		 * with kickoff and timer rearming. Never wait for the timer here:
+		 * this callback can run in hard IRQ context.
+		 */
+		spin_lock_irqsave(&dpu_enc->enc_spinlock, flags);
 		if (!dpu_enc->frame_busy_mask[0]) {
-			/**
-			 * suppress frame_done without waiter,
-			 * likely autorefresh
-			 */
 			trace_dpu_enc_frame_done_cb_not_busy(DRMID(drm_enc), event,
 					dpu_encoder_helper_get_intf_type(ready_phys->intf_mode),
 					ready_phys->hw_intf ? ready_phys->hw_intf->idx : -1,
 					ready_phys->hw_wb ? ready_phys->hw_wb->idx : -1);
+			spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
 			return;
 		}
-
-		/* One of the physical encoders has become idle */
 		for (i = 0; i < dpu_enc->num_phys_encs; i++) {
 			if (dpu_enc->phys_encs[i] == ready_phys) {
 				trace_dpu_enc_frame_done_cb(DRMID(drm_enc), i,
@@ -1592,20 +1600,23 @@ void dpu_encoder_frame_done_callback(
 				clear_bit(i, dpu_enc->frame_busy_mask);
 			}
 		}
-
 		if (!dpu_enc->frame_busy_mask[0]) {
 			atomic_set(&dpu_enc->frame_done_timeout_ms, 0);
+			dpu_enc->frame_done_deadline = 0;
 			timer_delete(&dpu_enc->frame_done_timer);
-
+			trace_dpu_enc_frame_watchdog(DRMID(drm_enc), "complete",
+				0, jiffies, 0, 0);
+			completed = true;
+		}
+		spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
+		if (completed) {
 			dpu_encoder_resource_control(drm_enc,
 					DPU_ENC_RC_EVENT_FRAME_DONE);
-
 			if (dpu_enc->crtc)
 				dpu_crtc_frame_event_cb(dpu_enc->crtc, event);
 		}
-	} else {
-		if (dpu_enc->crtc)
-			dpu_crtc_frame_event_cb(dpu_enc->crtc, event);
+	} else if (dpu_enc->crtc) {
+		dpu_crtc_frame_event_cb(dpu_enc->crtc, event);
 	}
 }
 
@@ -2133,17 +2144,28 @@ bool dpu_encoder_is_valid_for_commit(struct drm_encoder *drm_enc)
  */
 void dpu_encoder_start_frame_done_timer(struct drm_encoder *drm_enc)
 {
-	struct dpu_encoder_virt *dpu_enc;
-	unsigned long timeout_ms;
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
+	unsigned long flags, timeout_ms, now;
 
-	dpu_enc = to_dpu_encoder_virt(drm_enc);
 	timeout_ms = DPU_ENCODER_FRAME_DONE_TIMEOUT_FRAMES * 1000 /
 			drm_mode_vrefresh(&drm_enc->crtc->state->adjusted_mode);
-
+	spin_lock_irqsave(&dpu_enc->enc_spinlock, flags);
+	now = jiffies;
+	/* The completion IRQ can precede this post-kickoff call. */
+	if (!dpu_enc->frame_busy_mask[0]) {
+		trace_dpu_enc_frame_watchdog(DRMID(drm_enc), "arm_idle",
+			0, now, dpu_enc->frame_done_deadline,
+			atomic_read(&dpu_enc->frame_done_timeout_ms));
+		spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
+		return;
+	}
 	atomic_set(&dpu_enc->frame_done_timeout_ms, timeout_ms);
-	mod_timer(&dpu_enc->frame_done_timer,
-			jiffies + msecs_to_jiffies(timeout_ms));
-
+	dpu_enc->frame_done_deadline = now + msecs_to_jiffies(timeout_ms);
+	mod_timer(&dpu_enc->frame_done_timer, dpu_enc->frame_done_deadline);
+	trace_dpu_enc_frame_watchdog(DRMID(drm_enc), "arm",
+		dpu_enc->frame_busy_mask[0], now, dpu_enc->frame_done_deadline,
+		timeout_ms);
+	spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
 }
 
 /**
@@ -2711,29 +2733,45 @@ static void dpu_encoder_frame_done_timeout(struct timer_list *t)
 	struct dpu_encoder_virt *dpu_enc = timer_container_of(dpu_enc, t,
 							      frame_done_timer);
 	struct drm_encoder *drm_enc = &dpu_enc->base;
-	u32 event;
+	unsigned long flags, now, deadline, busy;
+	int timeout_ms;
+	u32 event = DPU_ENCODER_FRAME_EVENT_ERROR;
 
 	if (!drm_enc->dev) {
 		DPU_ERROR("invalid parameters\n");
 		return;
 	}
-
-	if (!dpu_enc->frame_busy_mask[0] || !dpu_enc->crtc) {
-		DRM_DEBUG_KMS("id:%u invalid timeout frame_busy_mask=%lu\n",
-			      DRMID(drm_enc), dpu_enc->frame_busy_mask[0]);
-		return;
-	} else if (!atomic_xchg(&dpu_enc->frame_done_timeout_ms, 0)) {
-		DRM_DEBUG_KMS("id:%u invalid timeout\n", DRMID(drm_enc));
+	spin_lock_irqsave(&dpu_enc->enc_spinlock, flags);
+	now = jiffies;
+	deadline = dpu_enc->frame_done_deadline;
+	busy = dpu_enc->frame_busy_mask[0];
+	timeout_ms = atomic_read(&dpu_enc->frame_done_timeout_ms);
+	trace_dpu_enc_frame_watchdog(DRMID(drm_enc), "expire_check",
+		busy, now, deadline, timeout_ms);
+	if (!busy || !dpu_enc->crtc || !timeout_ms) {
+		spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
 		return;
 	}
+	/* A callback from a previous expiry can already be running when
+	 * mod_timer rearms the next frame. Preserve that frame's deadline.
+	 */
+	if (time_before(now, deadline)) {
+		trace_dpu_enc_frame_watchdog(DRMID(drm_enc), "expire_stale",
+			busy, now, deadline, timeout_ms);
+		spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
+		return;
+	}
+	atomic_set(&dpu_enc->frame_done_timeout_ms, 0);
+	dpu_enc->frame_done_deadline = 0;
+	trace_dpu_enc_frame_watchdog(DRMID(drm_enc), "expire_claim",
+		busy, now, deadline, timeout_ms);
+	spin_unlock_irqrestore(&dpu_enc->enc_spinlock, flags);
 
+	/* Snapshot at the decision, before printk/register snapshot latency. */
+	trace_dpu_enc_frame_done_timeout(DRMID(drm_enc), event);
 	DPU_ERROR_ENC_RATELIMITED(dpu_enc, "frame done timeout\n");
-
 	if (atomic_inc_return(&dpu_enc->frame_done_timeout_cnt) == 1)
 		msm_disp_snapshot_state(drm_enc->dev);
-
-	event = DPU_ENCODER_FRAME_EVENT_ERROR;
-	trace_dpu_enc_frame_done_timeout(DRMID(drm_enc), event);
 	dpu_crtc_frame_event_cb(dpu_enc->crtc, event);
 }
 

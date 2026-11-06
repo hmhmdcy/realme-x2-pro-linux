@@ -220,6 +220,15 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 
 	DBG("id=%d", id);
 
+	ret = msm_dsi_host_quiesce_firmware(host);
+	if (ret)
+		goto phy_en_fail;
+	if (is_bonded_dsi && msm_dsi1) {
+		ret = msm_dsi_host_quiesce_firmware(msm_dsi1->host);
+		if (ret)
+			goto phy_en_fail;
+	}
+
 	ret = dsi_mgr_phy_enable(id, phy_shared_timings);
 	if (ret)
 		goto phy_en_fail;

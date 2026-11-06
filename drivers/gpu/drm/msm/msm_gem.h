@@ -137,6 +137,9 @@ struct msm_gem_vm {
 	/** @managed: is this a kernel managed VM? */
 	bool managed;
 
+	/** @iova_alignment: Address alignment for kernel managed allocations. */
+	u64 iova_alignment;
+
 	/**
 	 * @unusable: True if the VM has turned unusable because something
 	 * bad happened during an asynchronous request.

@@ -429,7 +429,10 @@ static u32 dpu_hw_ctl_poll_reset_status(struct dpu_hw_ctl *ctx, u32 timeout_us)
 			usleep_range(20, 50);
 	} while (status && ktime_compare_safe(ktime_get(), timeout) < 0);
 
-	return status;
+	/* A delayed wakeup can cross the deadline after hardware cleared
+	 * reset. Sample again rather than return the value from before sleep.
+	 */
+	return DPU_REG_READ(c, CTL_SW_RESET) & BIT(0);
 }
 
 static int dpu_hw_ctl_reset_control(struct dpu_hw_ctl *ctx)
@@ -478,6 +481,69 @@ static void dpu_hw_ctl_clear_all_blendstages(struct dpu_hw_ctl *ctx)
 	}
 
 	DPU_REG_WRITE(c, CTL_FETCH_PIPE_ACTIVE, 0);
+}
+
+/* Stop inherited command-mode fetches before replacing the IOMMU domain. */
+int dpu_hw_ctl_clear_boot_config(struct dpu_hw_ctl *ctx, u32 *cleared_intfs)
+{
+	struct dpu_hw_blk_reg_map *c = &ctx->hw;
+	u32 top = DPU_REG_READ(c, CTL_TOP);
+	u32 fetch = DPU_REG_READ(c, CTL_FETCH_PIPE_ACTIVE);
+	u32 intf = DPU_REG_READ(c, CTL_INTF_ACTIVE);
+	u32 dsc = DPU_REG_READ(c, CTL_DSC_ACTIVE);
+	u32 merge = DPU_REG_READ(c, CTL_MERGE_3D_ACTIVE);
+	u32 layers = 0;
+	int i, ret;
+
+	for (i = 0; i < ctx->mixer_count; i++) {
+		enum dpu_lm lm = ctx->mixer_hw_caps[i].id;
+
+		layers |= DPU_REG_READ(c, CTL_LAYER(lm));
+		layers |= DPU_REG_READ(c, CTL_LAYER_EXT(lm));
+		layers |= DPU_REG_READ(c, CTL_LAYER_EXT2(lm));
+		layers |= DPU_REG_READ(c, CTL_LAYER_EXT3(lm));
+	}
+
+	/* Video-mode shutdown requires stopping the INTF timing engine. */
+	if (!(top & BIT(17)) || (!layers && !fetch))
+		return 0;
+
+	pr_info("boot CTL%d: top=%#x layers=%#x fetch=%#x intf=%#x dsc=%#x\n",
+		ctx->idx - CTL_0, top, layers, fetch, intf, dsc);
+	ret = dpu_hw_ctl_reset_control(ctx);
+	if (ret)
+		return ret;
+
+	/* Detach the output before committing empty blend stages. */
+	DPU_REG_WRITE(c, CTL_INTF_ACTIVE, 0);
+	DPU_REG_WRITE(c, CTL_DSC_ACTIVE, 0);
+	DPU_REG_WRITE(c, CTL_MERGE_3D_ACTIVE, 0);
+	ctx->pending_intf_flush_mask = intf;
+	ctx->pending_dsc_flush_mask = dsc;
+	ctx->pending_merge_3d_flush_mask = merge;
+	if (intf)
+		ctx->pending_flush_mask |= BIT(INTF_IDX);
+	if (dsc)
+		ctx->pending_flush_mask |= BIT(DSC_IDX);
+	if (merge)
+		ctx->pending_flush_mask |= BIT(MERGE_3D_IDX);
+	dpu_hw_ctl_clear_all_blendstages(ctx);
+	for (i = 0; i < ctx->mixer_count; i++)
+		dpu_hw_ctl_update_pending_flush_mixer(ctx, ctx->mixer_hw_caps[i].id);
+	ctx->pending_flush_mask |= CTL_FLUSH_MASK_CTL;
+	dpu_hw_ctl_trigger_flush_v1(ctx);
+	dpu_hw_ctl_trigger_start(ctx);
+	dpu_hw_ctl_clear_pending_flush(ctx);
+	/* Discard an empty kickoff that was waiting for the disabled TE. */
+	ret = dpu_hw_ctl_reset_control(ctx);
+	if (ret)
+		return ret;
+
+	pr_info("boot CTL%d cleared: layer0=%#x layer1=%#x fetch=%#x\n",
+		ctx->idx - CTL_0, DPU_REG_READ(c, CTL_LAYER(LM_0)),
+		DPU_REG_READ(c, CTL_LAYER(LM_1)), DPU_REG_READ(c, CTL_FETCH_PIPE_ACTIVE));
+	*cleared_intfs |= intf;
+	return 0;
 }
 
 struct ctl_blend_config {

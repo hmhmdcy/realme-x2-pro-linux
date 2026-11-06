@@ -28,6 +28,11 @@ struct pdr_service {
 	bool need_notifier_remove;
 	bool need_locator_lookup;
 	bool service_connected;
+	bool lookup_failed;
+	u64 server_generation;
+	u64 state_sequence;
+	u64 locator_attempt;
+	struct qmi_txn *register_txn;
 
 	struct list_head node;
 };
@@ -39,6 +44,7 @@ struct pdr_handle {
 	struct sockaddr_qrtr locator_addr;
 
 	struct list_head lookups;
+	struct list_head retired;
 	struct list_head indack_list;
 
 	/* control access to pdr lookup/indack lists */
@@ -51,6 +57,9 @@ struct pdr_handle {
 	struct mutex lock;
 
 	bool locator_init_complete;
+	bool stopping;
+	u64 locator_generation;
+	u64 locator_run;
 
 	struct work_struct locator_work;
 	struct work_struct notifier_work;
@@ -67,26 +76,43 @@ struct pdr_list_node {
 	enum servreg_service_state curr_state;
 	u16 transaction_id;
 	struct pdr_service *pds;
+	struct sockaddr_qrtr addr;
+	u64 server_generation;
 	struct list_head node;
 };
+
+/* list_lock keeps the stack transaction alive until its owner detaches it. */
+static void pdr_cancel_registration(struct pdr_handle *pdr, struct pdr_service *pds)
+{
+	struct qmi_txn *txn = pds->register_txn;
+
+	lockdep_assert_held(&pdr->list_lock);
+	if (!txn)
+		return;
+	mutex_lock(&txn->lock);
+	txn->result = -ENETRESET;
+	complete(&txn->completion);
+	mutex_unlock(&txn->lock);
+	pds->register_txn = NULL;
+}
 
 static int pdr_locator_new_server(struct qmi_handle *qmi,
 				  struct qmi_service *svc)
 {
-	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
-					      locator_hdl);
+	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle, locator_hdl);
 
 	mutex_lock(&pdr->lock);
-	/* Create a local client port for QMI communication */
+	if (READ_ONCE(pdr->stopping)) {
+		mutex_unlock(&pdr->lock);
+		return -ESHUTDOWN;
+	}
 	pdr->locator_addr.sq_family = AF_QIPCRTR;
 	pdr->locator_addr.sq_node = svc->node;
 	pdr->locator_addr.sq_port = svc->port;
-
+	pdr->locator_generation++;
 	pdr->locator_init_complete = true;
-	mutex_unlock(&pdr->lock);
-
-	/* Service pending lookup requests */
 	schedule_work(&pdr->locator_work);
+	mutex_unlock(&pdr->lock);
 
 	return 0;
 }
@@ -94,14 +120,17 @@ static int pdr_locator_new_server(struct qmi_handle *qmi,
 static void pdr_locator_del_server(struct qmi_handle *qmi,
 				   struct qmi_service *svc)
 {
-	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
-					      locator_hdl);
+	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle, locator_hdl);
 
 	mutex_lock(&pdr->lock);
-	pdr->locator_init_complete = false;
-
-	pdr->locator_addr.sq_node = 0;
-	pdr->locator_addr.sq_port = 0;
+	if (!READ_ONCE(pdr->stopping) && pdr->locator_init_complete &&
+	    pdr->locator_addr.sq_node == svc->node &&
+	    pdr->locator_addr.sq_port == svc->port) {
+		pdr->locator_init_complete = false;
+		pdr->locator_generation++;
+		pdr->locator_addr.sq_node = 0;
+		pdr->locator_addr.sq_port = 0;
+	}
 	mutex_unlock(&pdr->lock);
 }
 
@@ -110,124 +139,220 @@ static const struct qmi_ops pdr_locator_ops = {
 	.del_server = pdr_locator_del_server,
 };
 
-static int pdr_register_listener(struct pdr_handle *pdr,
-				 struct pdr_service *pds,
-				 bool enable)
+static int pdr_register_listener(struct pdr_handle *pdr, struct pdr_service *pds,
+				 struct sockaddr_qrtr *addr, u64 generation,
+				 bool enable, int *state)
 {
-	struct servreg_register_listener_resp resp;
+	const char *service_path = pds->service_path;
+	struct servreg_register_listener_resp resp = { };
 	struct servreg_register_listener_req req;
 	struct qmi_txn txn;
 	int ret;
 
 	ret = qmi_txn_init(&pdr->notifier_hdl, &txn,
-			   servreg_register_listener_resp_ei,
-			   &resp);
+			   servreg_register_listener_resp_ei, &resp);
 	if (ret < 0)
 		return ret;
 
-	req.enable = enable;
-	strscpy(req.service_path, pds->service_path, sizeof(req.service_path));
+	mutex_lock(&pdr->list_lock);
+	if (pdr->stopping || pds->lookup_failed || !pds->service_connected ||
+	    pds->server_generation != generation) {
+		mutex_unlock(&pdr->list_lock);
+		qmi_txn_cancel(&txn);
+		return -ENETRESET;
+	}
+	pds->register_txn = &txn;
+	mutex_unlock(&pdr->list_lock);
 
-	ret = qmi_send_request(&pdr->notifier_hdl, &pds->addr,
-			       &txn, SERVREG_REGISTER_LISTENER_REQ,
+	req.enable = enable;
+	strscpy(req.service_path, service_path, sizeof(req.service_path));
+	ret = qmi_send_request(&pdr->notifier_hdl, addr, &txn,
+			       SERVREG_REGISTER_LISTENER_REQ,
 			       SERVREG_REGISTER_LISTENER_REQ_LEN,
-			       servreg_register_listener_req_ei,
-			       &req);
+			       servreg_register_listener_req_ei, &req);
 	if (ret < 0) {
+		mutex_lock(&pdr->list_lock);
+		if (pds->register_txn == &txn)
+			pds->register_txn = NULL;
+		mutex_unlock(&pdr->list_lock);
 		qmi_txn_cancel(&txn);
 		return ret;
 	}
 
 	ret = qmi_txn_wait(&txn, 5 * HZ);
+	mutex_lock(&pdr->list_lock);
+	if (pds->register_txn == &txn)
+		pds->register_txn = NULL;
+	mutex_unlock(&pdr->list_lock);
+	/* Server loss/release explicitly completed the transaction, not a timeout. */
+	if (ret == -ENETRESET)
+		return ret;
 	if (ret < 0) {
 		pr_err("PDR: %s register listener txn wait failed: %d\n",
-		       pds->service_path, ret);
+		       service_path, ret);
 		return ret;
 	}
-
 	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
 		pr_err("PDR: %s register listener failed: 0x%x\n",
-		       pds->service_path, resp.resp.error);
+		       service_path, resp.resp.error);
 		return -EREMOTEIO;
 	}
-
-	pds->state = resp.curr_state;
-
+	if (!resp.curr_state_valid) {
+		pr_err("PDR: %s register listener response has no state\n", service_path);
+		return -EPROTO;
+	}
+	*state = resp.curr_state;
 	return 0;
+}
+
+/* status_lock orders callbacks; list_lock is never held across client code. */
+static bool pdr_notify_pending_down(struct pdr_handle *pdr, struct pdr_service *pds)
+{
+	bool notify;
+
+	lockdep_assert_held(&pdr->status_lock);
+	mutex_lock(&pdr->list_lock);
+	notify = !pdr->stopping && !pds->lookup_failed && pds->need_notifier_remove;
+	if (notify) {
+		pds->need_notifier_remove = false;
+		pds->state = SERVREG_SERVICE_STATE_DOWN;
+	}
+	mutex_unlock(&pdr->list_lock);
+	if (notify)
+		pdr->status(SERVREG_SERVICE_STATE_DOWN, pds->service_path, pdr->priv);
+	return notify;
+}
+
+static void pdr_publish_registration(struct pdr_handle *pdr, struct pdr_service *pds,
+				     u64 generation, u64 sequence, int state)
+{
+	bool notify;
+
+	mutex_lock(&pdr->status_lock);
+	/* A coalesced DEL/NEW must release the old client's resources first. */
+	while (pdr_notify_pending_down(pdr, pds))
+		;
+	mutex_lock(&pdr->list_lock);
+	notify = !pdr->stopping && !pds->lookup_failed && pds->service_connected &&
+		 pds->server_generation == generation && pds->state_sequence == sequence;
+	if (notify)
+		pds->state = state;
+	mutex_unlock(&pdr->list_lock);
+	if (notify)
+		pdr->status(state, pds->service_path, pdr->priv);
+	mutex_unlock(&pdr->status_lock);
 }
 
 static void pdr_notifier_work(struct work_struct *work)
 {
-	struct pdr_handle *pdr = container_of(work, struct pdr_handle,
-					      notifier_work);
-	struct pdr_service *pds;
-	int ret;
+	struct pdr_handle *pdr = container_of(work, struct pdr_handle, notifier_work);
+	struct pdr_service *pds, *iter;
+	struct sockaddr_qrtr addr;
+	u64 generation, sequence;
+	bool remove;
+	int ret, state;
 
-	mutex_lock(&pdr->list_lock);
-	list_for_each_entry(pds, &pdr->lookups, node) {
-		if (pds->service_connected) {
-			if (!pds->need_notifier_register)
-				continue;
-
-			pds->need_notifier_register = false;
-			ret = pdr_register_listener(pdr, pds, true);
-			if (ret < 0)
-				pds->state = SERVREG_SERVICE_STATE_DOWN;
-		} else {
-			if (!pds->need_notifier_remove)
-				continue;
-
+	for (;;) {
+		pds = NULL;
+		mutex_lock(&pdr->status_lock);
+		mutex_lock(&pdr->list_lock);
+		if (!pdr->stopping) {
+			list_for_each_entry(iter, &pdr->lookups, node) {
+				if (iter->need_notifier_remove ||
+				    (iter->service_connected && iter->need_notifier_register)) {
+					pds = iter;
+					break;
+				}
+			}
+		}
+		if (!pds) {
+			mutex_unlock(&pdr->list_lock);
+			mutex_unlock(&pdr->status_lock);
+			return;
+		}
+		remove = pds->need_notifier_remove;
+		if (remove) {
 			pds->need_notifier_remove = false;
 			pds->state = SERVREG_SERVICE_STATE_DOWN;
+		} else {
+			pds->need_notifier_register = false;
+			addr = pds->addr;
+			generation = pds->server_generation;
+			sequence = pds->state_sequence;
 		}
-
-		mutex_lock(&pdr->status_lock);
-		pdr->status(pds->state, pds->service_path, pdr->priv);
+		mutex_unlock(&pdr->list_lock);
+		if (remove)
+			pdr->status(SERVREG_SERVICE_STATE_DOWN, pds->service_path, pdr->priv);
 		mutex_unlock(&pdr->status_lock);
+		if (remove)
+			continue;
+
+		/* RX control/indication callbacks must run while this transaction waits. */
+		ret = pdr_register_listener(pdr, pds, &addr, generation, true, &state);
+		if (ret < 0)
+			state = SERVREG_SERVICE_STATE_DOWN;
+		pdr_publish_registration(pdr, pds, generation, sequence, state);
 	}
-	mutex_unlock(&pdr->list_lock);
 }
 
 static int pdr_notifier_new_server(struct qmi_handle *qmi,
 				   struct qmi_service *svc)
 {
-	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
-					      notifier_hdl);
+	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle, notifier_hdl);
 	struct pdr_service *pds;
 
 	mutex_lock(&pdr->list_lock);
+	if (pdr->stopping) {
+		mutex_unlock(&pdr->list_lock);
+		return -ESHUTDOWN;
+	}
 	list_for_each_entry(pds, &pdr->lookups, node) {
-		if (pds->service == svc->service &&
-		    pds->instance == svc->instance) {
-			pds->service_connected = true;
-			pds->need_notifier_register = true;
-			pds->addr.sq_family = AF_QIPCRTR;
-			pds->addr.sq_node = svc->node;
-			pds->addr.sq_port = svc->port;
-			queue_work(pdr->notifier_wq, &pdr->notifier_work);
-		}
+		if (pds->service != svc->service || pds->instance != svc->instance)
+			continue;
+		if (pds->service_connected && pds->addr.sq_node == svc->node &&
+		    pds->addr.sq_port == svc->port)
+			continue;
+		if (pds->service_connected)
+			pds->need_notifier_remove = true;
+		pdr_cancel_registration(pdr, pds);
+		pds->server_generation++;
+		pds->state_sequence++;
+		pds->service_connected = true;
+		pds->need_notifier_register = true;
+		pds->addr.sq_family = AF_QIPCRTR;
+		pds->addr.sq_node = svc->node;
+		pds->addr.sq_port = svc->port;
+		queue_work(pdr->notifier_wq, &pdr->notifier_work);
+		if (pds->need_notifier_remove)
+			queue_work(pdr->indack_wq, &pdr->indack_work);
 	}
 	mutex_unlock(&pdr->list_lock);
-
 	return 0;
 }
 
 static void pdr_notifier_del_server(struct qmi_handle *qmi,
 				    struct qmi_service *svc)
 {
-	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
-					      notifier_hdl);
+	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle, notifier_hdl);
 	struct pdr_service *pds;
 
 	mutex_lock(&pdr->list_lock);
-	list_for_each_entry(pds, &pdr->lookups, node) {
-		if (pds->service == svc->service &&
-		    pds->instance == svc->instance) {
+	if (!pdr->stopping) {
+		list_for_each_entry(pds, &pdr->lookups, node) {
+			if (pds->service != svc->service || pds->instance != svc->instance ||
+			    !pds->service_connected || pds->addr.sq_node != svc->node ||
+			    pds->addr.sq_port != svc->port)
+				continue;
+			pdr_cancel_registration(pdr, pds);
+			pds->server_generation++;
+			pds->state_sequence++;
 			pds->service_connected = false;
+			pds->need_notifier_register = false;
 			pds->need_notifier_remove = true;
 			pds->addr.sq_node = 0;
 			pds->addr.sq_port = 0;
 			queue_work(pdr->notifier_wq, &pdr->notifier_work);
+			queue_work(pdr->indack_wq, &pdr->indack_work);
 		}
 	}
 	mutex_unlock(&pdr->list_lock);
@@ -239,7 +364,7 @@ static const struct qmi_ops pdr_notifier_ops = {
 };
 
 static int pdr_send_indack_msg(struct pdr_handle *pdr, struct pdr_service *pds,
-			       u16 tid)
+			       struct sockaddr_qrtr *addr, u16 tid)
 {
 	struct servreg_set_ack_resp resp;
 	struct servreg_set_ack_req req;
@@ -254,7 +379,7 @@ static int pdr_send_indack_msg(struct pdr_handle *pdr, struct pdr_service *pds,
 	req.transaction_id = tid;
 	strscpy(req.service_path, pds->service_path, sizeof(req.service_path));
 
-	ret = qmi_send_request(&pdr->notifier_hdl, &pds->addr,
+	ret = qmi_send_request(&pdr->notifier_hdl, addr,
 			       &txn, SERVREG_SET_ACK_REQ,
 			       SERVREG_SET_ACK_REQ_LEN,
 			       servreg_set_ack_req_ei,
@@ -267,74 +392,93 @@ static int pdr_send_indack_msg(struct pdr_handle *pdr, struct pdr_service *pds,
 
 static void pdr_indack_work(struct work_struct *work)
 {
-	struct pdr_handle *pdr = container_of(work, struct pdr_handle,
-					      indack_work);
-	struct pdr_list_node *ind, *tmp;
-	struct pdr_service *pds;
+	struct pdr_handle *pdr = container_of(work, struct pdr_handle, indack_work);
+	struct pdr_list_node *ind;
+	struct pdr_service *pds, *iter;
+	bool notify;
 
-	list_for_each_entry_safe(ind, tmp, &pdr->indack_list, node) {
-		pds = ind->pds;
-
+	for (;;) {
+		pds = NULL;
 		mutex_lock(&pdr->status_lock);
-		pds->state = ind->curr_state;
-		pdr->status(pds->state, pds->service_path, pdr->priv);
+		mutex_lock(&pdr->list_lock);
+		if (pdr->stopping)
+			goto done;
+		/* Deliver server loss even while notifier_work is waiting for QMI. */
+		list_for_each_entry(iter, &pdr->lookups, node) {
+			if (iter->need_notifier_remove) {
+				pds = iter;
+				break;
+			}
+		}
+		if (pds) {
+			mutex_unlock(&pdr->list_lock);
+			pdr_notify_pending_down(pdr, pds);
+			mutex_unlock(&pdr->status_lock);
+			continue;
+		}
+		if (list_empty(&pdr->indack_list))
+			goto done;
+		ind = list_first_entry(&pdr->indack_list, struct pdr_list_node, node);
+		list_del(&ind->node);
+		pds = ind->pds;
+		notify = !pds->lookup_failed && pds->service_connected &&
+			 pds->server_generation == ind->server_generation;
+		if (notify)
+			pds->state = ind->curr_state;
+		mutex_unlock(&pdr->list_lock);
+		if (notify)
+			pdr->status(ind->curr_state, pds->service_path, pdr->priv);
 		mutex_unlock(&pdr->status_lock);
 
-		/* Ack the indication after clients release the PD resources */
-		pdr_send_indack_msg(pdr, pds, ind->transaction_id);
-
-		mutex_lock(&pdr->list_lock);
-		list_del(&ind->node);
-		mutex_unlock(&pdr->list_lock);
-
+		/* Ack only the original peer, after the client has released resources. */
+		if (!READ_ONCE(pdr->stopping))
+			pdr_send_indack_msg(pdr, pds, &ind->addr, ind->transaction_id);
 		kfree(ind);
 	}
+done:
+	mutex_unlock(&pdr->list_lock);
+	mutex_unlock(&pdr->status_lock);
 }
 
-static void pdr_indication_cb(struct qmi_handle *qmi,
-			      struct sockaddr_qrtr *sq,
+static void pdr_indication_cb(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 			      struct qmi_txn *txn, const void *data)
 {
-	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
-					      notifier_hdl);
+	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle, notifier_hdl);
 	const struct servreg_state_updated_ind *ind_msg = data;
 	struct pdr_list_node *ind;
-	struct pdr_service *pds = NULL, *iter;
+	struct pdr_service *pds;
 
-	if (!ind_msg || !ind_msg->service_path[0] ||
-	    strlen(ind_msg->service_path) > SERVREG_NAME_LENGTH)
+	if (!sq || !ind_msg || !ind_msg->service_path[0] ||
+	    strnlen(ind_msg->service_path, sizeof(ind_msg->service_path)) > SERVREG_NAME_LENGTH)
 		return;
-
-	mutex_lock(&pdr->list_lock);
-	list_for_each_entry(iter, &pdr->lookups, node) {
-		if (strcmp(iter->service_path, ind_msg->service_path))
-			continue;
-
-		pds = iter;
-		break;
-	}
-	mutex_unlock(&pdr->list_lock);
-
-	if (!pds)
-		return;
-
-	pr_info("PDR: Indication received from %s, state: 0x%x, trans-id: %d\n",
-		ind_msg->service_path, ind_msg->curr_state,
-		ind_msg->transaction_id);
-
 	ind = kzalloc_obj(*ind);
 	if (!ind)
 		return;
 
-	ind->transaction_id = ind_msg->transaction_id;
-	ind->curr_state = ind_msg->curr_state;
-	ind->pds = pds;
-
 	mutex_lock(&pdr->list_lock);
-	list_add_tail(&ind->node, &pdr->indack_list);
+	if (!pdr->stopping) {
+		list_for_each_entry(pds, &pdr->lookups, node) {
+			if (strcmp(pds->service_path, ind_msg->service_path) ||
+			    !pds->service_connected || pds->addr.sq_node != sq->sq_node ||
+			    pds->addr.sq_port != sq->sq_port)
+				continue;
+			pds->state_sequence++;
+			ind->transaction_id = ind_msg->transaction_id;
+			ind->curr_state = ind_msg->curr_state;
+			ind->pds = pds;
+			ind->addr = *sq;
+			ind->server_generation = pds->server_generation;
+			list_add_tail(&ind->node, &pdr->indack_list);
+			queue_work(pdr->indack_wq, &pdr->indack_work);
+			mutex_unlock(&pdr->list_lock);
+			pr_info("PDR: Indication received from %s, state: 0x%x, trans-id: %d\n",
+				ind_msg->service_path, ind_msg->curr_state,
+				ind_msg->transaction_id);
+			return;
+		}
+	}
 	mutex_unlock(&pdr->list_lock);
-
-	queue_work(pdr->indack_wq, &pdr->indack_work);
+	kfree(ind);
 }
 
 static const struct qmi_msg_handler qmi_indication_handler[] = {
@@ -350,7 +494,7 @@ static const struct qmi_msg_handler qmi_indication_handler[] = {
 
 static int pdr_get_domain_list(struct servreg_get_domain_list_req *req,
 			       struct servreg_get_domain_list_resp *resp,
-			       struct pdr_handle *pdr)
+			       struct pdr_handle *pdr, struct sockaddr_qrtr *addr)
 {
 	struct qmi_txn txn;
 	int ret;
@@ -360,14 +504,12 @@ static int pdr_get_domain_list(struct servreg_get_domain_list_req *req,
 	if (ret < 0)
 		return ret;
 
-	mutex_lock(&pdr->lock);
 	ret = qmi_send_request(&pdr->locator_hdl,
-			       &pdr->locator_addr,
+			       addr,
 			       &txn, SERVREG_GET_DOMAIN_LIST_REQ,
 			       SERVREG_GET_DOMAIN_LIST_REQ_MAX_LEN,
 			       servreg_get_domain_list_req_ei,
 			       req);
-	mutex_unlock(&pdr->lock);
 	if (ret < 0) {
 		qmi_txn_cancel(&txn);
 		return ret;
@@ -389,7 +531,8 @@ static int pdr_get_domain_list(struct servreg_get_domain_list_req *req,
 	return 0;
 }
 
-static int pdr_locate_service(struct pdr_handle *pdr, struct pdr_service *pds)
+static int pdr_locate_service(struct pdr_handle *pdr, struct pdr_service *pds,
+			      struct sockaddr_qrtr *addr)
 {
 	struct servreg_get_domain_list_req req;
 	struct servreg_location_entry *entry;
@@ -407,7 +550,7 @@ static int pdr_locate_service(struct pdr_handle *pdr, struct pdr_service *pds)
 
 	do {
 		req.domain_offset = domains_read;
-		ret = pdr_get_domain_list(&req, resp, pdr);
+		ret = pdr_get_domain_list(&req, resp, pdr, addr);
 		if (ret < 0)
 			return ret;
 
@@ -439,60 +582,93 @@ static int pdr_locate_service(struct pdr_handle *pdr, struct pdr_service *pds)
 }
 
 static void pdr_notify_lookup_failure(struct pdr_handle *pdr,
-				      struct pdr_service *pds,
-				      int err)
+				      struct pdr_service *pds, int err)
 {
-	pr_err("PDR: service lookup for %s failed: %d\n",
-	       pds->service_name, err);
-
+	pr_err("PDR: service lookup for %s failed: %d\n", pds->service_name, err);
 	if (err == -ENXIO)
 		return;
 
-	list_del(&pds->node);
-	pds->state = SERVREG_LOCATOR_ERR;
 	mutex_lock(&pdr->status_lock);
-	pdr->status(pds->state, pds->service_path, pdr->priv);
+	mutex_lock(&pdr->list_lock);
+	if (pdr->stopping || pds->lookup_failed) {
+		mutex_unlock(&pdr->list_lock);
+		mutex_unlock(&pdr->status_lock);
+		return;
+	}
+	pdr_cancel_registration(pdr, pds);
+	pds->lookup_failed = true;
+	pds->need_locator_lookup = false;
+	pds->need_notifier_register = false;
+	pds->need_notifier_remove = false;
+	pds->state = SERVREG_LOCATOR_ERR;
+	/* Workers and queued indications retain this object until handle release. */
+	list_move_tail(&pds->node, &pdr->retired);
+	mutex_unlock(&pdr->list_lock);
+	pdr->status(SERVREG_LOCATOR_ERR, pds->service_path, pdr->priv);
 	mutex_unlock(&pdr->status_lock);
-	kfree(pds);
 }
 
 static void pdr_locator_work(struct work_struct *work)
 {
-	struct pdr_handle *pdr = container_of(work, struct pdr_handle,
-					      locator_work);
-	struct pdr_service *pds, *tmp;
-	int ret = 0;
-
-	/* Bail out early if the SERVREG LOCATOR QMI service is not up */
-	mutex_lock(&pdr->lock);
-	if (!pdr->locator_init_complete) {
-		mutex_unlock(&pdr->lock);
-		pr_debug("PDR: SERVICE LOCATOR service not available\n");
-		return;
-	}
-	mutex_unlock(&pdr->lock);
+	struct pdr_handle *pdr = container_of(work, struct pdr_handle, locator_work);
+	struct pdr_service snapshot, *pds, *iter;
+	struct sockaddr_qrtr addr;
+	u64 generation, run;
+	int ret;
 
 	mutex_lock(&pdr->list_lock);
-	list_for_each_entry_safe(pds, tmp, &pdr->lookups, node) {
-		if (!pds->need_locator_lookup)
-			continue;
-
-		ret = pdr_locate_service(pdr, pds);
-		if (ret < 0) {
-			pdr_notify_lookup_failure(pdr, pds, ret);
-			continue;
-		}
-
-		ret = qmi_add_lookup(&pdr->notifier_hdl, pds->service, 1,
-				     pds->instance);
-		if (ret < 0) {
-			pdr_notify_lookup_failure(pdr, pds, ret);
-			continue;
-		}
-
-		pds->need_locator_lookup = false;
-	}
+	run = ++pdr->locator_run;
 	mutex_unlock(&pdr->list_lock);
+	for (;;) {
+		mutex_lock(&pdr->lock);
+		if (!pdr->locator_init_complete || READ_ONCE(pdr->stopping)) {
+			mutex_unlock(&pdr->lock);
+			return;
+		}
+		addr = pdr->locator_addr;
+		generation = pdr->locator_generation;
+		mutex_unlock(&pdr->lock);
+
+		pds = NULL;
+		mutex_lock(&pdr->list_lock);
+		if (!pdr->stopping) {
+			list_for_each_entry(iter, &pdr->lookups, node) {
+				if (iter->need_locator_lookup && iter->locator_attempt != run) {
+					pds = iter;
+					pds->locator_attempt = run;
+					snapshot = *pds;
+					break;
+				}
+			}
+		}
+		mutex_unlock(&pdr->list_lock);
+		if (!pds)
+			return;
+
+		ret = pdr_locate_service(pdr, &snapshot, &addr);
+		mutex_lock(&pdr->lock);
+		if (!pdr->locator_init_complete || pdr->locator_generation != generation ||
+		    READ_ONCE(pdr->stopping)) {
+			mutex_unlock(&pdr->lock);
+			continue;
+		}
+		if (!ret) {
+			mutex_lock(&pdr->list_lock);
+			pds->service_data_valid = snapshot.service_data_valid;
+			pds->service_data = snapshot.service_data;
+			pds->instance = snapshot.instance;
+			pds->need_locator_lookup = false;
+			mutex_unlock(&pdr->list_lock);
+		}
+		mutex_unlock(&pdr->lock);
+		if (ret < 0) {
+			pdr_notify_lookup_failure(pdr, pds, ret);
+			continue;
+		}
+		ret = qmi_add_lookup(&pdr->notifier_hdl, pds->service, 1, snapshot.instance);
+		if (ret < 0)
+			pdr_notify_lookup_failure(pdr, pds, ret);
+	}
 }
 
 /**
@@ -529,6 +705,10 @@ struct pdr_service *pdr_add_lookup(struct pdr_handle *pdr,
 	pds->need_locator_lookup = true;
 
 	mutex_lock(&pdr->list_lock);
+	if (pdr->stopping) {
+		mutex_unlock(&pdr->list_lock);
+		return ERR_PTR(-ESHUTDOWN);
+	}
 	list_for_each_entry(tmp, &pdr->lookups, node) {
 		if (strcmp(tmp->service_path, service_path))
 			continue;
@@ -538,9 +718,8 @@ struct pdr_service *pdr_add_lookup(struct pdr_handle *pdr,
 	}
 
 	list_add(&pds->node, &pdr->lookups);
-	mutex_unlock(&pdr->list_lock);
-
 	schedule_work(&pdr->locator_work);
+	mutex_unlock(&pdr->list_lock);
 
 	return_ptr(pds);
 }
@@ -568,6 +747,10 @@ int pdr_restart_pd(struct pdr_handle *pdr, struct pdr_service *pds)
 		return -EINVAL;
 
 	mutex_lock(&pdr->list_lock);
+	if (pdr->stopping) {
+		mutex_unlock(&pdr->list_lock);
+		return -ESHUTDOWN;
+	}
 	list_for_each_entry(tmp, &pdr->lookups, node) {
 		if (tmp != pds)
 			continue;
@@ -656,6 +839,7 @@ struct pdr_handle *pdr_handle_alloc(void (*status)(int state,
 	mutex_init(&pdr->lock);
 
 	INIT_LIST_HEAD(&pdr->lookups);
+	INIT_LIST_HEAD(&pdr->retired);
 	INIT_LIST_HEAD(&pdr->indack_list);
 
 	INIT_WORK(&pdr->locator_work, pdr_locator_work);
@@ -692,6 +876,11 @@ struct pdr_handle *pdr_handle_alloc(void (*status)(int state,
 	return_ptr(pdr);
 
 release_qmi_handle:
+	WRITE_ONCE(pdr->stopping, true);
+	mutex_lock(&pdr->lock);
+	pdr->locator_init_complete = false;
+	mutex_unlock(&pdr->lock);
+	cancel_work_sync(&pdr->locator_work);
 	qmi_handle_release(&pdr->locator_hdl);
 destroy_indack:
 	destroy_workqueue(pdr->indack_wq);
@@ -711,27 +900,45 @@ EXPORT_SYMBOL_GPL(pdr_handle_alloc);
 void pdr_handle_release(struct pdr_handle *pdr)
 {
 	struct pdr_service *pds, *tmp;
+	struct pdr_list_node *ind, *next;
 
 	if (IS_ERR_OR_NULL(pdr))
 		return;
 
 	mutex_lock(&pdr->list_lock);
+	WRITE_ONCE(pdr->stopping, true);
+	list_for_each_entry(pds, &pdr->lookups, node)
+		pdr_cancel_registration(pdr, pds);
+	list_for_each_entry(pds, &pdr->retired, node)
+		pdr_cancel_registration(pdr, pds);
+	mutex_unlock(&pdr->list_lock);
+	/* Pair with locator callbacks so no callback can queue after cancellation. */
+	mutex_lock(&pdr->lock);
+	pdr->locator_init_complete = false;
+	pdr->locator_generation++;
+	mutex_unlock(&pdr->lock);
+
+	/* Keep QMI RX alive until every in-flight transaction has finished. */
+	cancel_work_sync(&pdr->locator_work);
+	cancel_work_sync(&pdr->notifier_work);
+	cancel_work_sync(&pdr->indack_work);
+	qmi_handle_release(&pdr->locator_hdl);
+	qmi_handle_release(&pdr->notifier_hdl);
+	destroy_workqueue(pdr->notifier_wq);
+	destroy_workqueue(pdr->indack_wq);
+
+	list_for_each_entry_safe(ind, next, &pdr->indack_list, node) {
+		list_del(&ind->node);
+		kfree(ind);
+	}
 	list_for_each_entry_safe(pds, tmp, &pdr->lookups, node) {
 		list_del(&pds->node);
 		kfree(pds);
 	}
-	mutex_unlock(&pdr->list_lock);
-
-	cancel_work_sync(&pdr->locator_work);
-	cancel_work_sync(&pdr->notifier_work);
-	cancel_work_sync(&pdr->indack_work);
-
-	destroy_workqueue(pdr->notifier_wq);
-	destroy_workqueue(pdr->indack_wq);
-
-	qmi_handle_release(&pdr->locator_hdl);
-	qmi_handle_release(&pdr->notifier_hdl);
-
+	list_for_each_entry_safe(pds, tmp, &pdr->retired, node) {
+		list_del(&pds->node);
+		kfree(pds);
+	}
 	kfree(pdr);
 }
 EXPORT_SYMBOL_GPL(pdr_handle_release);

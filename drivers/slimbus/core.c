@@ -306,27 +306,50 @@ int slim_unregister_controller(struct slim_controller *ctrl)
 EXPORT_SYMBOL_GPL(slim_unregister_controller);
 
 /**
- * slim_report_absent() - Controller calls this function when a device
- *	reports absent, OR when the device cannot be communicated with
+ * slim_report_absent() - Invalidate a device address and report it absent
+ *
+ * Controllers call this when a device reports absent or cannot be reached.
+ * A client can also use it after a hardware reset invalidates its address.
  *
  * @sbdev: Device that cannot be reached, or sent report absent
  */
 void slim_report_absent(struct slim_device *sbdev)
 {
 	struct slim_controller *ctrl = sbdev->ctrl;
+	bool was_valid;
 
 	if (!ctrl)
 		return;
 
 	/* invalidate logical addresses */
 	mutex_lock(&ctrl->lock);
+	was_valid = sbdev->is_laddr_valid;
 	sbdev->is_laddr_valid = false;
-	mutex_unlock(&ctrl->lock);
-	if (!ctrl->get_laddr)
+	if (was_valid && !ctrl->get_laddr)
 		ida_free(&ctrl->laddr_ida, sbdev->laddr);
+	mutex_unlock(&ctrl->lock);
 	slim_device_update_status(sbdev, SLIM_DEVICE_STATUS_DOWN);
 }
 EXPORT_SYMBOL_GPL(slim_report_absent);
+
+/**
+ * slim_device_is_online() - Check whether a device has a usable transport
+ * @sdev: Device whose logical address and transport are being checked
+ *
+ * This is a non-sleeping snapshot, not a lifetime or transaction lock. A
+ * suspended transport is online if normal runtime resume can reach it.
+ */
+bool slim_device_is_online(struct slim_device *sdev)
+{
+	struct slim_controller *ctrl = sdev->ctrl;
+
+	if (!ctrl || READ_ONCE(sdev->status) != SLIM_DEVICE_STATUS_UP ||
+	    !READ_ONCE(sdev->is_laddr_valid))
+		return false;
+
+	return !ctrl->is_online || ctrl->is_online(ctrl);
+}
+EXPORT_SYMBOL_GPL(slim_device_is_online);
 
 static bool slim_eaddr_equal(const struct slim_eaddr *a,
 			     const struct slim_eaddr *b)

@@ -2950,3 +2950,10 @@ config SND_SOC_LPASS_TX_MACRO
 	tristate "Qualcomm TX Macro in LPASS(Low Power Audio SubSystem)"
 
 endmenu
+
+config SND_SOC_MAX98937_SAMURAI
+	tristate "Realme X2 Pro MAX98937 revision 0x43"
+	depends on I2C && OF && GPIOLIB
+	select REGMAP_I2C
+	help
+	  Board-specific native I2S playback with fixed conservative gain.

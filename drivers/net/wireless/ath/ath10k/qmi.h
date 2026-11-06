@@ -27,6 +27,7 @@ struct ath10k_msa_mem_info {
 	phys_addr_t addr;
 	u32 size;
 	bool secure;
+	bool mapped;
 };
 
 struct ath10k_qmi_chip_info {

@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/panel/samsung,sofef03f-m.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung SOFEF03F_M AMOLED panel
+
+maintainers:
+  - hmhmdcy <hmhmdcy@users.noreply.github.com>
+
+description: |
+  Samsung SOFEF03F_M 1080x2400 AMOLED panel used in the Realme X2 Pro.
+  It uses four DSI lanes in command mode with DSC 1.1, 8 bits per component
+  and 8 bits per pixel. Initial support is limited to the stock 60 Hz mode.
+  The board switches VCI and VDDD with separate GPIO enables.
+
+allOf:
+  - $ref: panel-common.yaml#
+
+properties:
+  compatible:
+    const: samsung,sofef03f-m
+  reg:
+    maxItems: 1
+  vddio-supply:
+    description: 1.8 V panel I/O supply
+  vdda-supply:
+    description: 3.0 V analog supply shared with the touch controller
+  reset-gpios:
+    maxItems: 1
+  vci-enable-gpios:
+    maxItems: 1
+    description: Enable the VCI switch, active high
+  vddd-enable-gpios:
+    maxItems: 1
+    description: Enable the VDDD switch, active high
+  port: true
+
+required:
+  - compatible
+  - reg
+  - vddio-supply
+  - vdda-supply
+  - reset-gpios
+  - vci-enable-gpios
+  - vddd-enable-gpios
+  - port
+
+additionalProperties: false

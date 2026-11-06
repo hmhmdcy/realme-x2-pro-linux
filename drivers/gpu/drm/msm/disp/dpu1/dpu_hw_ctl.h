@@ -358,4 +358,13 @@ struct dpu_hw_ctl *dpu_hw_ctl_init(struct drm_device *dev,
 				   u32 mixer_count,
 				   const struct dpu_lm_cfg *mixer);
 
+/**
+ * dpu_hw_ctl_clear_boot_config() - stop inherited DPU 5 command-mode data paths
+ * @ctx: CTL context, with clocks enabled
+ * @cleared_intfs: accumulates output bits covered by successful CTL resets
+ *
+ * Return: 0 on success or a negative error if CTL reset times out.
+ */
+int dpu_hw_ctl_clear_boot_config(struct dpu_hw_ctl *ctx, u32 *cleared_intfs);
+
 #endif /*_DPU_HW_CTL_H */

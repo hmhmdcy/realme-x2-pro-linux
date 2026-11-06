@@ -213,6 +213,26 @@ static int __fill_rpmh_msg(struct rpmh_request *req, enum rpmh_state state,
 	return 0;
 }
 
+/*
+ * SM8150 and SC8180X do not answer RPMh reads: the request is never
+ * completed by the AOSS, it consumes an ACTIVE TCS, and every following
+ * write is blocked until rpmh_read() gives up after RPMH_TIMEOUT_MS.
+ * The boot then stalls for ten seconds and everything that needs a write
+ * afterwards fails (regulators, RPMh clocks, dwc3).  Do not send read
+ * commands on those platforms at all.
+ */
+static bool rpmh_read_unsupported(void)
+{
+	static int unsupported = -1;
+
+	if (unsupported < 0)
+		unsupported = of_machine_is_compatible("qcom,sm8150") ||
+			      of_machine_is_compatible("qcom,sc8180x");
+
+	return unsupported;
+}
+
+
 /**
  * rpmh_read: Read a resource value
  *
@@ -228,6 +248,9 @@ static int __fill_rpmh_msg(struct rpmh_request *req, enum rpmh_state state,
  */
 int rpmh_read(const struct device *dev, struct tcs_cmd *cmd)
 {
+	if (rpmh_read_unsupported())
+		return -EOPNOTSUPP;
+
 	DECLARE_COMPLETION_ONSTACK(compl);
 	DEFINE_RPMH_MSG_ONSTACK(dev, RPMH_ACTIVE_ONLY_STATE, &compl, rpm_msg);
 	int ret;

@@ -14,6 +14,7 @@
 #include <net/sock.h>
 
 #include "qrtr.h"
+#include <trace/events/qrtr.h>
 
 #define QRTR_PROTO_VER_1 1
 #define QRTR_PROTO_VER_2 3
@@ -121,7 +122,6 @@ static DEFINE_XARRAY_ALLOC(qrtr_ports);
  * @nid: node id
  * @qrtr_tx_flow: xarray of qrtr_tx_flow, keyed by node << 32 | port
  * @qrtr_tx_lock: lock for qrtr_tx_flow inserts
- * @hello_sent: hello packet send successful
  * @rx_queue: receive queue
  * @item: list item for broadcast list
  * @say_hello: delayed work for sending hello packet
@@ -134,8 +134,6 @@ struct qrtr_node {
 
 	struct xarray qrtr_tx_flow;
 	struct mutex qrtr_tx_lock; /* for qrtr_tx_flow */
-
-	bool hello_sent;
 
 	struct sk_buff_head rx_queue;
 	struct list_head item;
@@ -348,14 +346,7 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 	struct qrtr_hdr_v1 *hdr;
 	size_t len = skb->len;
 	int rc, confirm_rx;
-
-	mutex_lock(&node->ep_lock);
-	if (!node->hello_sent && type != QRTR_TYPE_HELLO) {
-		mutex_unlock(&node->ep_lock);
-		kfree_skb(skb);
-		return -EAGAIN;
-	}
-	mutex_unlock(&node->ep_lock);
+	u32 wire_node = READ_ONCE(node->nid);
 
 	confirm_rx = qrtr_tx_wait(node, to->sq_node, to->sq_port, type);
 	if (confirm_rx < 0) {
@@ -378,6 +369,7 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 
 	hdr->size = cpu_to_le32(len);
 	hdr->confirm_rx = cpu_to_le32(!!confirm_rx);
+	wire_node = le32_to_cpu(hdr->dst_node_id);
 
 	rc = skb_put_padto(skb, ALIGN(len, 4) + sizeof(*hdr));
 
@@ -388,14 +380,15 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 			rc = node->ep->xmit(node->ep, skb);
 		else
 			kfree_skb(skb);
-		if (!rc && type == QRTR_TYPE_HELLO)
-			node->hello_sent = true;
 		mutex_unlock(&node->ep_lock);
 	}
 	/* Need to ensure that a subsequent message carries the otherwise lost
 	 * confirm_rx flag if we dropped this one */
 	if (rc && confirm_rx)
 		qrtr_tx_flow_failed(node, to->sq_node, to->sq_port);
+
+	trace_qrtr_endpoint_tx(READ_ONCE(node->nid), wire_node, type,
+		from->sq_port, to->sq_port, len, rc);
 
 	if (rc == -EAGAIN && type == QRTR_TYPE_HELLO)
 		schedule_delayed_work(&node->say_hello, msecs_to_jiffies(100));
@@ -628,10 +621,6 @@ void qrtr_endpoint_hello(struct qrtr_endpoint *ep)
 {
 	struct qrtr_node *node = ep->node;
 
-	mutex_lock(&node->ep_lock);
-	node->hello_sent = false;
-	mutex_unlock(&node->ep_lock);
-
 	schedule_delayed_work(&node->say_hello, 0);
 }
 EXPORT_SYMBOL_GPL(qrtr_endpoint_hello);
@@ -661,7 +650,6 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int nid)
 	node->nid = QRTR_EP_NID_AUTO;
 	node->ep = ep;
 
-	node->hello_sent = false;
 	INIT_DELAYED_WORK(&node->say_hello, qrtr_hello_work);
 
 	xa_init(&node->qrtr_tx_flow);

@@ -11,6 +11,7 @@
 #include <linux/interconnect.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/soc/qcom/qcom_aoss.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/smem_state.h>
@@ -123,11 +124,45 @@ int qcom_q6v5_unprepare(struct qcom_q6v5 *q6v5)
 }
 EXPORT_SYMBOL_GPL(qcom_q6v5_unprepare);
 
+/* Read-only diagnostics at a real IRQ; never request a DSP crash. */
+static void q6v5_report_reason(struct qcom_q6v5 *q6v5, const char *event)
+{
+	size_t len = 0, text_len = 0;
+	const char *msg;
+
+	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
+	if (!IS_ERR(msg) && len)
+		text_len = strnlen(msg, min_t(size_t, len, 4096));
+	if (of_machine_is_compatible("realme,samurai"))
+		dev_err(q6v5->dev,
+			"samurai crash SMEM event=%s item=%d error=%ld bytes=%zu first=%u text=%zu running=%u handover=%u\n",
+			event, q6v5->crash_reason, IS_ERR(msg) ? PTR_ERR(msg) : 0,
+			len, !IS_ERR(msg) && len ? (unsigned char)msg[0] : 0,
+			text_len, q6v5->running, q6v5->handover_issued);
+	if (text_len)
+		dev_err(q6v5->dev, "%s received: %.*s\n", event,
+			(int)text_len, msg);
+	else
+		dev_err(q6v5->dev, "%s without message\n", event);
+	/* Host ANY resolves global SMEM, not the APPS/MODEM private partition. */
+	if (!text_len && q6v5->crash_reason == 421 &&
+	    of_machine_is_compatible("realme,samurai")) {
+		len = 0;
+		msg = qcom_smem_get(1, q6v5->crash_reason, &len);
+		text_len = !IS_ERR(msg) && len ?
+			strnlen(msg, min_t(size_t, len, 4096)) : 0;
+		dev_err(q6v5->dev,
+			"samurai crash SMEM modem-host=1 item=421 error=%ld bytes=%zu text=%zu\n",
+			IS_ERR(msg) ? PTR_ERR(msg) : 0, len, text_len);
+		if (text_len)
+			dev_err(q6v5->dev, "modem partition reason: %.*s\n",
+				(int)text_len, msg);
+	}
+}
+
 static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
-	size_t len;
-	char *msg;
 
 	/* Sometimes the stop triggers a watchdog rather than a stop-ack */
 	if (!q6v5->running) {
@@ -135,11 +170,7 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 
-	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
-	if (!IS_ERR(msg) && len > 0 && msg[0])
-		dev_err(q6v5->dev, "watchdog received: %s\n", msg);
-	else
-		dev_err(q6v5->dev, "watchdog without message\n");
+	q6v5_report_reason(q6v5, "watchdog");
 
 	q6v5->running = false;
 	rproc_report_crash(q6v5->rproc, RPROC_WATCHDOG);
@@ -150,17 +181,11 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
-	size_t len;
-	char *msg;
 
 	if (!q6v5->running)
 		return IRQ_HANDLED;
 
-	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
-	if (!IS_ERR(msg) && len > 0 && msg[0])
-		dev_err(q6v5->dev, "fatal error received: %s\n", msg);
-	else
-		dev_err(q6v5->dev, "fatal error without message\n");
+	q6v5_report_reason(q6v5, "fatal error");
 
 	q6v5->running = false;
 	rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
@@ -198,6 +223,10 @@ EXPORT_SYMBOL_GPL(qcom_q6v5_wait_for_start);
 static irqreturn_t q6v5_handover_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
+
+	if (of_machine_is_compatible("realme,samurai"))
+		dev_info(q6v5->dev, "samurai Q6 handover item=%d running=%u\n",
+			 q6v5->crash_reason, q6v5->running);
 
 	q6v5->handover_issued = true;
 

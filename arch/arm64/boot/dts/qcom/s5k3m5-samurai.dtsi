@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* RMX1931 telephoto: own board19781 wiring and independently decoded mode3. */
+&cam_pmic_p {
+	regulators {
+		cam_tele_vdig: ldo2 {
+			regulator-name = "cam-tele-vdig";
+			regulator-min-microvolt = <1050000>;
+			regulator-max-microvolt = <1056000>;
+			regulator-enable-ramp-delay = <1000>;
+		};
+		cam_tele_vana: ldo6 {
+			regulator-name = "cam-tele-vana";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-enable-ramp-delay = <1000>;
+		};
+	};
+};
+
+&tlmm {
+	cam_tele_mclk_active: camera-tele-mclk-active-state {
+		pins = "gpio16";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+	cam_tele_mclk_sleep: camera-tele-mclk-sleep-state {
+		pins = "gpio16";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+	cam_tele_reset: camera-tele-reset-state {
+		pins = "gpio23";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+};
+
+&cci1_i2c0 {
+	status = "okay";
+	cam_tele: camera@2d {
+		compatible = "samsung,s5k3m5";
+		reg = <0x2d>;
+		orientation = <1>;
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+		vdda-supply = <&cam_tele_vana>;
+		vddd-supply = <&cam_tele_vdig>;
+		vddio-supply = <&vreg_l1c_1p8>;
+		clocks = <&camcc CAM_CC_MCLK3_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK3_CLK>;
+		assigned-clock-rates = <19200000>;
+		reset-gpios = <&tlmm 23 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_tele_mclk_active &cam_tele_reset>;
+		pinctrl-1 = <&cam_tele_mclk_sleep &cam_tele_reset>;
+		port {
+			cam_tele_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				/* OEM OP-PLL candidate; physical timing is not yet verified. */
+				link-frequencies = /bits/ 64 <723200000>;
+				remote-endpoint = <&cam_tele_csiphy3_ep>;
+			};
+		};
+	};
+};
+
+&camss {
+	ports {
+		port@3 {
+			reg = <3>;
+			cam_tele_csiphy3_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				remote-endpoint = <&cam_tele_ep>;
+			};
+		};
+	};
+};

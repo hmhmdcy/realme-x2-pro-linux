@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* RMX1931 camera wiring and voltage constraints from the 19781 board. */
+&cam_pmic_p {
+	/* PLDO inputs are not software-managed here; no dummy VIN is added. */
+	regulators {
+		cam_rear_vdig: ldo1 {
+			regulator-name = "cam-rear-vdig";
+			regulator-min-microvolt = <1100000>;
+			regulator-max-microvolt = <1104000>;
+		};
+		cam_rear_vana: ldo4 {
+			regulator-name = "cam-rear-vana";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+		};
+	};
+};
+
+&tlmm {
+	cam_rear_mclk_active: camera-rear-mclk-active-state {
+		pins = "gpio14";
+		function = "cam_mclk";
+		drive-strength = <6>;
+		bias-disable;
+	};
+	cam_rear_mclk_sleep: camera-rear-mclk-sleep-state {
+		pins = "gpio14";
+		function = "cam_mclk";
+		drive-strength = <6>;
+		bias-pull-down;
+	};
+	cam_rear_reset_active: camera-rear-reset-active-state {
+		pins = "gpio30";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+	cam_rear_reset_sleep: camera-rear-reset-sleep-state {
+		pins = "gpio30";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+};
+
+&cci0 {
+	status = "okay";
+};
+
+&cci0_i2c1 {
+	status = "okay";
+	cam_rear: camera@10 {
+		compatible = "sony,imx319";
+		orientation = <1>;
+		reg = <0x10>;
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+		vana-supply = <&cam_rear_vana>;
+		vdig-supply = <&cam_rear_vdig>;
+		vif-supply = <&vreg_l1c_1p8>;
+		clocks = <&camcc CAM_CC_MCLK1_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK>;
+		assigned-clock-rates = <19200000>;
+		reset-gpios = <&tlmm 30 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_rear_mclk_active &cam_rear_reset_active>;
+		pinctrl-1 = <&cam_rear_mclk_sleep &cam_rear_reset_sleep>;
+		port {
+			cam_rear_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				/* Four-lane sensor PLL operating point, validated in 237. */
+				link-frequencies = /bits/ 64 <222000000>;
+				remote-endpoint = <&cam_rear_csiphy1_ep>;
+			};
+		};
+	};
+};
+
+&camss {
+	ports {
+		port@1 {
+			reg = <1>;
+			cam_rear_csiphy1_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				remote-endpoint = <&cam_rear_ep>;
+			};
+		};
+	};
+};

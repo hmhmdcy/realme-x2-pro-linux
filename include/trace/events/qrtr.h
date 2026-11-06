@@ -112,6 +112,30 @@ TRACE_EVENT(qrtr_ns_message,
 	)
 );
 
+TRACE_EVENT(qrtr_endpoint_tx,
+	TP_PROTO(unsigned int node, unsigned int wire_node, int type, unsigned int src_port,
+		 unsigned int dst_port, unsigned int bytes, int result),
+	TP_ARGS(node, wire_node, type, src_port, dst_port, bytes, result),
+	TP_STRUCT__entry(
+		__field(unsigned int, node)
+		__field(unsigned int, wire_node)
+		__field(int, type)
+		__field(unsigned int, src_port)
+		__field(unsigned int, dst_port)
+		__field(unsigned int, bytes)
+		__field(int, result)
+	),
+	TP_fast_assign(
+		__entry->node = node; __entry->wire_node = wire_node;
+		__entry->type = type;
+		__entry->src_port = src_port; __entry->dst_port = dst_port;
+		__entry->bytes = bytes; __entry->result = result;
+	),
+	TP_printk("node=%u wire_node=%u type=%d src_port=%u dst_port=%u bytes=%u result=%d",
+		  __entry->node, __entry->wire_node, __entry->type, __entry->src_port,
+		  __entry->dst_port, __entry->bytes, __entry->result)
+);
+
 #endif /* _TRACE_QRTR_H */
 
 /* This part must be outside protection */

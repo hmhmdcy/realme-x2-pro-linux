@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
 
+#include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+
+#include <dt-bindings/gpio/gpio.h>
 
 #include "pinctrl-msm.h"
 
@@ -1523,9 +1526,65 @@ static const struct msm_pinctrl_soc_data sm8150_pinctrl = {
 	.wakeirq_dual_edge_errata = true,
 };
 
+/* Keep the panel dark while Linux replaces the firmware DSC pipeline. */
+static void sm8150_samurai_reset_boot_panel(struct platform_device *pdev)
+{
+	struct device_node *panel;
+	struct of_phandle_args args;
+	struct gpio_desc *reset;
+	int ret;
+
+	if (!of_machine_is_compatible("realme,samurai"))
+		return;
+
+	panel = of_find_compatible_node(NULL, NULL, "samsung,sofef03f-m");
+	if (!panel)
+		return;
+	if (!of_device_is_available(panel))
+		goto put_panel;
+
+	ret = of_parse_phandle_with_args(panel, "reset-gpios", "#gpio-cells",
+					 0, &args);
+	if (ret)
+		goto warn;
+	if (args.np != pdev->dev.of_node || args.args_count != 2 ||
+	    args.args[0] != 6 || args.args[1] != GPIO_ACTIVE_LOW) {
+		of_node_put(args.np);
+		ret = -EINVAL;
+		goto warn;
+	}
+	of_node_put(args.np);
+
+	reset = fwnode_gpiod_get_index(of_fwnode_handle(panel), "reset", 0,
+				       GPIOD_ASIS, "samurai-boot-panel");
+	if (IS_ERR(reset)) {
+		ret = PTR_ERR(reset);
+		goto warn;
+	}
+
+	/* Logical assertion drives this active-low reset to physical low. */
+	ret = gpiod_direction_output(reset, 1);
+	/* Leave the level in place, but allow the panel driver to claim it. */
+	gpiod_put(reset);
+	if (ret)
+		goto warn;
+
+	dev_info(&pdev->dev, "SOFEF03F boot reset asserted before display takeover\n");
+	goto put_panel;
+warn:
+	dev_warn(&pdev->dev, "SOFEF03F boot reset unavailable: %d\n", ret);
+put_panel:
+	of_node_put(panel);
+}
+
 static int sm8150_pinctrl_probe(struct platform_device *pdev)
 {
-	return msm_pinctrl_probe(pdev, &sm8150_pinctrl);
+	int ret;
+
+	ret = msm_pinctrl_probe(pdev, &sm8150_pinctrl);
+	if (!ret)
+		sm8150_samurai_reset_boot_panel(pdev);
+	return ret;
 }
 
 static const struct of_device_id sm8150_pinctrl_of_match[] = {

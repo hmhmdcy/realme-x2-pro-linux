@@ -2378,6 +2378,8 @@ a6xx_create_vm(struct msm_gpu *gpu, struct platform_device *pdev)
 static struct drm_gpuvm *
 a6xx_create_private_vm(struct msm_gpu *gpu, bool kernel_managed)
 {
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct drm_gpuvm *vm;
 	struct msm_mmu *mmu;
 
 	mmu = msm_iommu_pagetable_create(to_msm_vm(gpu->vm)->mmu, kernel_managed);
@@ -2385,8 +2387,14 @@ a6xx_create_private_vm(struct msm_gpu *gpu, bool kernel_managed)
 	if (IS_ERR(mmu))
 		return ERR_CAST(mmu);
 
-	return msm_gem_vm_create(gpu->dev, mmu, "gpu", ADRENO_VM_START,
-				 adreno_private_vm_size(gpu), kernel_managed);
+	vm = msm_gem_vm_create(gpu->dev, mmu, "gpu", ADRENO_VM_START,
+			       adreno_private_vm_size(gpu), kernel_managed);
+
+	/* A640 GMEM resolves fault on unaligned legacy BO starts. */
+	if (!IS_ERR(vm) && kernel_managed && adreno_is_a640(adreno_gpu))
+		to_msm_vm(vm)->iova_alignment = SZ_64K;
+
+	return vm;
 }
 
 static uint32_t a6xx_get_rptr(struct msm_gpu *gpu, struct msm_ringbuffer *ring)

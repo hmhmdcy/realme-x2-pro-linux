@@ -467,6 +467,49 @@ static int dpu_hw_intf_connect_external_te(struct dpu_hw_intf *intf,
 	return orig;
 }
 
+/* SM8150 command-mode boot paths must stop automatic frame requests first. */
+int dpu_hw_intf_clear_boot_config(struct dpu_hw_intf *intf)
+{
+	struct dpu_hw_blk_reg_map *c = &intf->hw;
+	u32 te = DPU_REG_READ(c, INTF_TEAR_TEAR_CHECK_EN);
+	u32 refresh = DPU_REG_READ(c, INTF_TEAR_AUTOREFRESH_CONFIG);
+	u32 trigger = DPU_REG_READ(c, INTF_DSI_CMD_MODE_TRIGGER_EN);
+	u32 height = DPU_REG_READ(c, INTF_TEAR_VSYNC_INIT_VAL) & 0xffff;
+	u32 line;
+	int ret = 0;
+
+	if (!te && !(refresh & BIT(31)) && !trigger)
+		return 0;
+
+	pr_info("boot INTF%d: tearcheck=%#x autorefresh=%#x trigger=%#x height=%u line=%#x\n",
+		intf->idx - INTF_0, te, refresh, trigger, height,
+		DPU_REG_READ(c, INTF_TEAR_LINE_COUNT));
+	dpu_hw_intf_connect_external_te(intf, false);
+	dpu_hw_intf_setup_autorefresh_config(intf, 0, false);
+	/* Keep the identity domain until the inherited frame finishes. */
+	if (refresh & BIT(31)) {
+		if (!height)
+			return -EINVAL;
+		ret = readl_poll_timeout(c->blk_addr + INTF_TEAR_LINE_COUNT, line,
+					 !(line & 0xffff) || (line & 0xffff) >= height,
+					 100, 50000);
+		if (ret) {
+			pr_info("boot INTF%d frame stalled: line=%#x height=%u out=%#x count=%#x\n",
+			       intf->idx - INTF_0, line, height,
+			       DPU_REG_READ(c, INTF_TEAR_OUT_LINE_COUNT),
+			       DPU_REG_READ(c, INTF_TEAR_INT_COUNT_VAL));
+			/* The caller must abort this inherited frame with CTL reset. */
+		}
+	}
+	dpu_hw_intf_disable_te(intf);
+	DPU_REG_WRITE(c, INTF_DSI_CMD_MODE_TRIGGER_EN, 0);
+	pr_info("boot INTF%d stopped: tearcheck=%#x autorefresh=%#x trigger=%#x\n",
+		intf->idx - INTF_0, DPU_REG_READ(c, INTF_TEAR_TEAR_CHECK_EN),
+		DPU_REG_READ(c, INTF_TEAR_AUTOREFRESH_CONFIG),
+		DPU_REG_READ(c, INTF_DSI_CMD_MODE_TRIGGER_EN));
+	return ret;
+}
+
 static int dpu_hw_intf_get_vsync_info(struct dpu_hw_intf *intf,
 		struct dpu_hw_pp_vsync_info *info)
 {

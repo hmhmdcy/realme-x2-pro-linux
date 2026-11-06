@@ -9,6 +9,7 @@
 #include <linux/mfd/wcd934x/registers.h>
 #include <linux/mfd/wcd934x/wcd934x.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
@@ -30,6 +31,24 @@
 			.type_rising_val = 0,			\
 		},						\
 	}
+
+struct wcd934x_priv {
+	struct wcd934x_ddata ddata;
+	/* Serializes UP, DOWN and removal of status-scoped resources. */
+	struct mutex lock;
+	bool up;
+	bool ready;
+};
+
+static struct wcd934x_priv *wcd934x_get_private(struct slim_device *sdev)
+{
+	struct wcd934x_ddata *ddata = dev_get_drvdata(&sdev->dev);
+
+	if (!ddata)
+		return NULL;
+
+	return container_of(ddata, struct wcd934x_priv, ddata);
+}
 
 static const struct mfd_cell wcd934x_devices[] = {
 	{
@@ -139,16 +158,32 @@ static int wcd934x_bring_up(struct wcd934x_ddata *ddata)
 	dev_info(ddata->dev, "WCD934x chip id major 0x%x, minor 0x%x\n",
 		 id_major, id_minor);
 
-	regmap_write(regmap, WCD934X_CODEC_RPM_RST_CTL, 0x01);
-	regmap_write(regmap, WCD934X_SIDO_NEW_VOUT_A_STARTUP, 0x19);
-	regmap_write(regmap, WCD934X_SIDO_NEW_VOUT_D_STARTUP, 0x15);
+	ret = regmap_write(regmap, WCD934X_CODEC_RPM_RST_CTL, 0x01);
+	if (ret)
+		return ret;
+	ret = regmap_write(regmap, WCD934X_SIDO_NEW_VOUT_A_STARTUP, 0x19);
+	if (ret)
+		return ret;
+	ret = regmap_write(regmap, WCD934X_SIDO_NEW_VOUT_D_STARTUP, 0x15);
+	if (ret)
+		return ret;
 	/* Add 1msec delay for VOUT to settle */
 	usleep_range(1000, 1100);
-	regmap_write(regmap, WCD934X_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x5);
-	regmap_write(regmap, WCD934X_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x7);
-	regmap_write(regmap, WCD934X_CODEC_RPM_RST_CTL, 0x3);
-	regmap_write(regmap, WCD934X_CODEC_RPM_RST_CTL, 0x7);
-	regmap_write(regmap, WCD934X_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x3);
+	ret = regmap_write(regmap, WCD934X_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x5);
+	if (ret)
+		return ret;
+	ret = regmap_write(regmap, WCD934X_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x7);
+	if (ret)
+		return ret;
+	ret = regmap_write(regmap, WCD934X_CODEC_RPM_RST_CTL, 0x3);
+	if (ret)
+		return ret;
+	ret = regmap_write(regmap, WCD934X_CODEC_RPM_RST_CTL, 0x7);
+	if (ret)
+		return ret;
+	ret = regmap_write(regmap, WCD934X_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x3);
+	if (ret)
+		return ret;
 
 	return 0;
 }
@@ -156,57 +191,168 @@ static int wcd934x_bring_up(struct wcd934x_ddata *ddata)
 static int wcd934x_slim_status_up(struct slim_device *sdev)
 {
 	struct device *dev = &sdev->dev;
-	struct wcd934x_ddata *ddata;
+	struct wcd934x_priv *priv = wcd934x_get_private(sdev);
+	struct wcd934x_ddata *ddata = &priv->ddata;
+	struct regmap *regmap;
 	int ret;
 
-	ddata = dev_get_drvdata(dev);
+	if (priv->up)
+		return 0;
 
-	ddata->regmap = regmap_init_slimbus(sdev, &wcd934x_regmap_config);
-	if (IS_ERR(ddata->regmap)) {
-		dev_err(dev, "Error allocating slim regmap\n");
-		return PTR_ERR(ddata->regmap);
-	}
+	regmap = regmap_init_slimbus(sdev, &wcd934x_regmap_config);
+	if (IS_ERR(regmap))
+		return dev_err_probe(dev, PTR_ERR(regmap), "Error allocating slim regmap\n");
+	ddata->regmap = regmap;
 
 	ret = wcd934x_bring_up(ddata);
 	if (ret) {
 		dev_err(dev, "Failed to bring up WCD934X: err = %d\n", ret);
-		return ret;
+		goto err_regmap;
 	}
 
-	ret = devm_regmap_add_irq_chip(dev, ddata->regmap, ddata->irq,
-				       IRQF_TRIGGER_HIGH, 0,
-				       &wcd934x_regmap_irq_chip,
-				       &ddata->irq_data);
+	ret = regmap_add_irq_chip(regmap, ddata->irq, IRQF_TRIGGER_HIGH, 0,
+				  &wcd934x_regmap_irq_chip, &ddata->irq_data);
 	if (ret) {
 		dev_err(dev, "Failed to add IRQ chip: err = %d\n", ret);
-		return ret;
+		goto err_regmap;
 	}
 
 	ret = mfd_add_devices(dev, PLATFORM_DEVID_AUTO, wcd934x_devices,
 			      ARRAY_SIZE(wcd934x_devices), NULL, 0, NULL);
 	if (ret) {
-		dev_err(dev, "Failed to add child devices: err = %d\n",
-			ret);
-		return ret;
+		dev_err(dev, "Failed to add child devices: err = %d\n", ret);
+		goto err_irq;
 	}
+	priv->up = true;
+
+	return 0;
+
+err_irq:
+	regmap_del_irq_chip(ddata->irq, ddata->irq_data);
+	ddata->irq_data = NULL;
+err_regmap:
+	regmap_exit(regmap);
+	ddata->regmap = NULL;
 
 	return ret;
+}
+
+static void wcd934x_slim_status_down(struct slim_device *sdev)
+{
+	struct wcd934x_priv *priv = wcd934x_get_private(sdev);
+	struct wcd934x_ddata *ddata = &priv->ddata;
+
+	if (!priv->up)
+		return;
+
+	/* Stop and synchronize the parent thread before child teardown can sleep. */
+	disable_irq(ddata->irq);
+
+	/*
+	 * The transport is already gone on DOWN. IRQ frees must only update
+	 * software state; this map is discarded, never synced back to hardware.
+	 * An ordinary driver removal while UP still performs real register I/O.
+	 */
+	if (sdev->status == SLIM_DEVICE_STATUS_DOWN)
+		regcache_cache_only(ddata->regmap, true);
+
+	/* Children must release their virtual IRQs before the domain is freed. */
+	mfd_remove_devices(&sdev->dev);
+	regmap_del_irq_chip(ddata->irq, ddata->irq_data);
+	ddata->irq_data = NULL;
+	regmap_exit(ddata->regmap);
+	ddata->regmap = NULL;
+	priv->up = false;
 }
 
 static int wcd934x_slim_status(struct slim_device *sdev,
 			       enum slim_device_status status)
 {
+	struct wcd934x_priv *priv = wcd934x_get_private(sdev);
+	int ret = 0;
+
+	if (!priv)
+		return -EPROBE_DEFER;
+
+	mutex_lock(&priv->lock);
+	if (!priv->ready) {
+		ret = -EPROBE_DEFER;
+		goto unlock;
+	}
 	switch (status) {
 	case SLIM_DEVICE_STATUS_UP:
-		return wcd934x_slim_status_up(sdev);
+		ret = wcd934x_slim_status_up(sdev);
+		break;
 	case SLIM_DEVICE_STATUS_DOWN:
-		mfd_remove_devices(&sdev->dev);
+		wcd934x_slim_status_down(sdev);
 		break;
 	default:
-		return -EINVAL;
+		ret = -EINVAL;
+		break;
 	}
+unlock:
+	mutex_unlock(&priv->lock);
+
+	return ret;
+}
+
+static int wcd934x_finish_probe(struct slim_device *sdev)
+{
+	struct wcd934x_priv *priv = wcd934x_get_private(sdev);
+	int ret;
+
+	/* Address assignment can call device_status: do not hold priv->lock. */
+	ret = slim_get_logical_addr(sdev);
+	if (ret)
+		return ret;
+
+	mutex_lock(&priv->lock);
+	priv->ready = true;
+	ret = wcd934x_slim_status_up(sdev);
+	mutex_unlock(&priv->lock);
+
+	return ret;
+}
+
+static int wcd934x_reset_addresses(struct slim_device *sdev)
+{
+	struct device_node *np;
+	struct slim_device *sidev;
+
+	np = of_parse_phandle(sdev->dev.of_node, "slim-ifc-dev", 0);
+	if (!np)
+		return -EINVAL;
+	sidev = of_slim_get_device(sdev->ctrl, np);
+	of_node_put(np);
+	if (!sidev)
+		return -EPROBE_DEFER;
+
+	/* Reset affects both the primary and interface logical devices. */
+	slim_report_absent(sidev);
+	slim_report_absent(sdev);
+	put_device(&sidev->dev);
 
 	return 0;
+}
+
+static void wcd934x_stop_action(void *data)
+{
+	struct slim_device *sdev = data;
+	struct wcd934x_priv *priv = wcd934x_get_private(sdev);
+
+	if (!priv)
+		return;
+	mutex_lock(&priv->lock);
+	priv->ready = false;
+	wcd934x_slim_status_down(sdev);
+	mutex_unlock(&priv->lock);
+}
+
+static void wcd934x_disable_supplies(void *data)
+{
+	struct wcd934x_ddata *ddata = data;
+
+	regulator_bulk_disable(WCD934X_MAX_SUPPLY, ddata->supplies);
 }
 
 static int wcd934x_slim_probe(struct slim_device *sdev)
@@ -214,12 +360,16 @@ static int wcd934x_slim_probe(struct slim_device *sdev)
 	struct device *dev = &sdev->dev;
 	struct device_node *np = dev->of_node;
 	struct wcd934x_ddata *ddata;
+	struct wcd934x_priv *priv;
 	struct gpio_desc *reset_gpio;
 	int ret;
 
-	ddata = devm_kzalloc(dev, sizeof(*ddata), GFP_KERNEL);
-	if (!ddata)
-		return	-ENOMEM;
+	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	ddata = &priv->ddata;
+	ddata->dev = dev;
+	mutex_init(&priv->lock);
 
 	ddata->irq = of_irq_get(np, 0);
 	if (ddata->irq < 0)
@@ -237,13 +387,16 @@ static int wcd934x_slim_probe(struct slim_device *sdev)
 	ddata->supplies[3].supply = "vdd-rx";
 	ddata->supplies[4].supply = "vdd-io";
 
-	ret = regulator_bulk_get(dev, WCD934X_MAX_SUPPLY, ddata->supplies);
+	ret = devm_regulator_bulk_get(dev, WCD934X_MAX_SUPPLY, ddata->supplies);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to get supplies\n");
 
 	ret = regulator_bulk_enable(WCD934X_MAX_SUPPLY, ddata->supplies);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to enable supplies\n");
+	ret = devm_add_action_or_reset(dev, wcd934x_disable_supplies, ddata);
+	if (ret)
+		return ret;
 
 	/*
 	 * For WCD934X, it takes about 600us for the Vout_A and
@@ -252,31 +405,28 @@ static int wcd934x_slim_probe(struct slim_device *sdev)
 	 */
 	usleep_range(600, 650);
 	reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(reset_gpio)) {
-		ret = dev_err_probe(dev, PTR_ERR(reset_gpio),
-				    "Failed to get reset gpio\n");
-		goto err_disable_regulators;
-	}
+	if (IS_ERR(reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(reset_gpio),
+				     "Failed to get reset gpio\n");
 	msleep(20);
 	gpiod_set_value(reset_gpio, 1);
 	msleep(20);
 
-	ddata->dev = dev;
+	ret = wcd934x_reset_addresses(sdev);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to invalidate SLIM addresses\n");
+
 	dev_set_drvdata(dev, ddata);
+	ret = devm_add_action_or_reset(dev, wcd934x_stop_action, sdev);
+	if (ret)
+		return ret;
 
-	return 0;
-
-err_disable_regulators:
-	regulator_bulk_disable(WCD934X_MAX_SUPPLY, ddata->supplies);
-	return ret;
+	return wcd934x_finish_probe(sdev);
 }
 
 static void wcd934x_slim_remove(struct slim_device *sdev)
 {
-	struct wcd934x_ddata *ddata = dev_get_drvdata(&sdev->dev);
-
-	regulator_bulk_disable(WCD934X_MAX_SUPPLY, ddata->supplies);
-	mfd_remove_devices(&sdev->dev);
+	wcd934x_stop_action(sdev);
 }
 
 static const struct slim_device_id wcd934x_slim_id[] = {

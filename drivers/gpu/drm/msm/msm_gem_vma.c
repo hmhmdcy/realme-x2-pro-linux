@@ -389,7 +389,7 @@ msm_gem_vma_new(struct drm_gpuvm *gpuvm, struct drm_gem_object *obj,
 		BUG_ON(offset != 0);
 		BUG_ON(!obj);  /* NULL mappings not valid for kernel managed VM */
 		ret = drm_mm_insert_node_in_range(&vm->mm, &vma->node,
-						obj->size, PAGE_SIZE, 0,
+						obj->size, vm->iova_alignment, 0,
 						range_start, range_end, 0);
 
 		if (ret)
@@ -864,6 +864,7 @@ msm_gem_vm_create(struct drm_device *drm, struct msm_mmu *mmu, const char *name,
 	vm->mmu = mmu;
 	mutex_init(&vm->mmu_lock);
 	vm->managed = managed;
+	vm->iova_alignment = PAGE_SIZE;
 
 	drm_mm_init(&vm->mm, va_start, va_size);
 

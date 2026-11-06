@@ -467,6 +467,31 @@ DECLARE_EVENT_CLASS(dpu_id_event_template,
 	),
 	TP_printk("id=%u, event=%u", __entry->drm_id, __entry->event)
 );
+TRACE_EVENT(dpu_enc_frame_watchdog,
+	TP_PROTO(uint32_t drm_id, const char *action, unsigned long busy,
+		 unsigned long now, unsigned long deadline, int timeout_ms),
+	TP_ARGS(drm_id, action, busy, now, deadline, timeout_ms),
+	TP_STRUCT__entry(
+		__field(uint32_t, drm_id)
+		__string(action, action)
+		__field(unsigned long, busy)
+		__field(unsigned long, now)
+		__field(unsigned long, deadline)
+		__field(int, timeout_ms)
+	),
+	TP_fast_assign(
+		__entry->drm_id = drm_id;
+		__assign_str(action);
+		__entry->busy = busy;
+		__entry->now = now;
+		__entry->deadline = deadline;
+		__entry->timeout_ms = timeout_ms;
+	),
+	TP_printk("id=%u action=%s busy=%lx now=%lu deadline=%lu timeout_ms=%d",
+		__entry->drm_id, __get_str(action), __entry->busy, __entry->now,
+		__entry->deadline, __entry->timeout_ms)
+);
+
 DEFINE_EVENT(dpu_id_event_template, dpu_enc_frame_done_timeout,
 	TP_PROTO(uint32_t drm_id, u32 event),
 	TP_ARGS(drm_id, event)
@@ -990,6 +1015,23 @@ DEFINE_EVENT(dpu_hw_ctl_pending_flush_template, dpu_hw_ctl_trigger_prepare,
 DEFINE_EVENT(dpu_hw_ctl_pending_flush_template, dpu_hw_ctl_trigger_start,
 	TP_PROTO(u32 pending_mask, u32 ctl_flush),
 	TP_ARGS(pending_mask, ctl_flush)
+);
+
+TRACE_EVENT(dpu_first_frame_backlight,
+	    TP_PROTO(u32 crtc, u32 encoder, int ret),
+	    TP_ARGS(crtc, encoder, ret),
+	    TP_STRUCT__entry(
+		    __field(u32, crtc)
+		    __field(u32, encoder)
+		    __field(int, ret)
+	    ),
+	    TP_fast_assign(
+		    __entry->crtc = crtc;
+		    __entry->encoder = encoder;
+		    __entry->ret = ret;
+	    ),
+	    TP_printk("crtc=%u encoder=%u ret=%d", __entry->crtc,
+		      __entry->encoder, __entry->ret)
 );
 
 #define DPU_ATRACE_END(name) trace_tracing_mark_write(current->tgid, name, 0)

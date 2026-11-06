@@ -212,6 +212,43 @@ fail:
 	return rc ? rc : -EFAULT;
 }
 
+int dpu_rm_clear_boot_config(struct dpu_rm *rm, const struct dpu_mdss_cfg *cat)
+{
+	int i, ret;
+	u32 stalled_intfs = 0, cleared_intfs = 0;
+
+	for (i = 0; i < cat->intf_count; i++) {
+		struct dpu_hw_intf *intf;
+
+		if (cat->intf[i].type != INTF_DSI)
+			continue;
+		intf = rm->hw_intf[cat->intf[i].id - INTF_0];
+		ret = dpu_hw_intf_clear_boot_config(intf);
+		if (ret == -ETIMEDOUT)
+			stalled_intfs |= BIT(intf->idx - INTF_0);
+		else if (ret)
+			return ret;
+	}
+
+	for (i = 0; i < cat->ctl_count; i++) {
+		struct dpu_hw_ctl *ctl;
+
+		ctl = to_dpu_hw_ctl(rm->ctl_blks[cat->ctl[i].id - CTL_0]);
+		ret = dpu_hw_ctl_clear_boot_config(ctl, &cleared_intfs);
+		if (ret < 0)
+			return ret;
+	}
+
+	/* Never change domains with a stalled frame and no confirmed CMD reset. */
+	if (stalled_intfs & ~cleared_intfs)
+		return -ETIMEDOUT;
+	if (stalled_intfs)
+		pr_info("boot stalled INTF mask=%#x aborted, CTL outputs=%#x\n",
+			stalled_intfs, cleared_intfs);
+
+	return 0;
+}
+
 static bool _dpu_rm_needs_split_display(const struct msm_display_topology *top)
 {
 	return top->num_intf > 1;

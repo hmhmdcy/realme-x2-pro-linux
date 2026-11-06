@@ -692,8 +692,12 @@ static struct dma_async_tx_descriptor *bam_prep_slave_sg(struct dma_chan *chan,
 	/* allocate enough room to accommodate the number of entries */
 	num_alloc = sg_nents_for_dma(sgl, sg_len, BAM_FIFO_SIZE);
 	async_desc = kzalloc_flex(*async_desc, desc, num_alloc, GFP_NOWAIT);
-	if (!async_desc)
+	if (!async_desc) {
+		dev_err_once(bdev->dev,
+			     "BAM DMA diagnostic: allocation failed count=%u sg_len=%u len=%u direction=%d\n",
+			     num_alloc, sg_len, sg_dma_len(sgl), direction);
 		return NULL;
+	}
 
 	if (flags & DMA_PREP_FENCE)
 		async_desc->flags |= DESC_FLAG_NWD;

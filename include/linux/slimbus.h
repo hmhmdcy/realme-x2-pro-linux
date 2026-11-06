@@ -177,6 +177,7 @@ struct slim_device *of_slim_get_device(struct slim_controller *ctrl,
 struct slim_device *slim_get_device(struct slim_controller *ctrl,
 				    struct slim_eaddr *e_addr);
 int slim_get_logical_addr(struct slim_device *sbdev);
+void slim_report_absent(struct slim_device *sbdev);
 
 /* Information Element management messages */
 #define SLIM_MSG_MC_REQUEST_INFORMATION          0x20
@@ -198,6 +199,8 @@ int slim_writeb(struct slim_device *sdev, u32 addr, u8 value);
 int slim_read(struct slim_device *sdev, u32 addr, size_t count, u8 *val);
 int slim_write(struct slim_device *sdev, u32 addr, size_t count, u8 *val);
 
+bool slim_device_is_online(struct slim_device *sdev);
+
 /* SLIMbus Stream apis */
 struct slim_stream_runtime;
 struct slim_stream_runtime *slim_stream_allocate(struct slim_device *dev,
@@ -207,6 +210,7 @@ int slim_stream_prepare(struct slim_stream_runtime *stream,
 int slim_stream_enable(struct slim_stream_runtime *stream);
 int slim_stream_disable(struct slim_stream_runtime *stream);
 int slim_stream_unprepare(struct slim_stream_runtime *stream);
+int slim_stream_abort(struct slim_stream_runtime *stream);
 int slim_stream_free(struct slim_stream_runtime *stream);
 
 #endif /* _LINUX_SLIMBUS_H */

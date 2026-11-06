@@ -1409,6 +1409,8 @@ patternProperties:
     description: Raystar Optronics, Inc.
   "^rda,.*":
     description: Unisoc Communications, Inc.
+  "^realme,.*":
+    description: Realme
   "^realtek,.*":
     description: Realtek Semiconductor Corp.
   "^relfor,.*":

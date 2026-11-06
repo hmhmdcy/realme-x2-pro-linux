@@ -13,6 +13,7 @@
 #include <linux/soc/qcom/apr.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/rpmsg.h>
+#include <linux/srcu.h>
 #include <linux/of.h>
 
 enum {
@@ -30,6 +31,7 @@ struct packet_router {
 	spinlock_t svcs_lock;
 	spinlock_t rx_lock;
 	struct idr svcs_idr;
+	struct srcu_struct apr_srcu;
 	int dest_domain_id;
 	int type;
 	struct pdr_handle *pdr;
@@ -191,13 +193,14 @@ static int apr_do_rx_callback(struct packet_router *apr, struct apr_rx_buf *abuf
 {
 	uint16_t hdr_size, msg_type, ver, svc_id;
 	struct pkt_router_svc *svc;
-	struct apr_device *adev;
+	struct apr_device *adev = NULL;
 	struct apr_driver *adrv = NULL;
-	struct apr_resp_pkt resp;
+	struct apr_resp_pkt resp = {};
 	struct apr_hdr *hdr;
 	unsigned long flags;
 	void *buf = abuf->buf;
 	int len = abuf->len;
+	int idx;
 
 	hdr = buf;
 	ver = APR_HDR_FIELD_VER(hdr->hdr_field);
@@ -210,7 +213,7 @@ static int apr_do_rx_callback(struct packet_router *apr, struct apr_rx_buf *abuf
 		return -EINVAL;
 	}
 
-	if (hdr->pkt_size < APR_HDR_SIZE || hdr->pkt_size != len) {
+	if (hdr->pkt_size < hdr_size || hdr->pkt_size != len) {
 		dev_err(apr->dev, "APR: Wrong packet size\n");
 		return -EINVAL;
 	}
@@ -229,10 +232,11 @@ static int apr_do_rx_callback(struct packet_router *apr, struct apr_rx_buf *abuf
 		return -EINVAL;
 	}
 
+	idx = srcu_read_lock(&apr->apr_srcu);
 	svc_id = hdr->dest_svc;
 	spin_lock_irqsave(&apr->svcs_lock, flags);
 	svc = idr_find(&apr->svcs_idr, svc_id);
-	if (svc && svc->dev->driver) {
+	if (svc && svc_to_apr_device(svc)->dev.driver) {
 		adev = svc_to_apr_device(svc);
 		adrv = to_apr_driver(adev->dev.driver);
 	}
@@ -241,6 +245,7 @@ static int apr_do_rx_callback(struct packet_router *apr, struct apr_rx_buf *abuf
 	if (!adrv || !adev) {
 		dev_err(apr->dev, "APR: service is not registered (%d)\n",
 			svc_id);
+		srcu_read_unlock(&apr->apr_srcu, idx);
 		return -EINVAL;
 	}
 
@@ -254,7 +259,9 @@ static int apr_do_rx_callback(struct packet_router *apr, struct apr_rx_buf *abuf
 	if (resp.payload_size > 0)
 		resp.payload = buf + hdr_size;
 
-	adrv->callback(adev, &resp);
+	if (adrv->callback)
+		adrv->callback(adev, &resp);
+	srcu_read_unlock(&apr->apr_srcu, idx);
 
 	return 0;
 }
@@ -361,30 +368,70 @@ static int apr_device_match(struct device *dev, const struct device_driver *drv)
 	return 0;
 }
 
+/* Device creation and driver binding have separate lifetimes. */
+static int apr_register_service(struct apr_device *adev)
+{
+	struct packet_router *apr = dev_get_drvdata(adev->dev.parent);
+	struct pkt_router_svc *old;
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&apr->svcs_lock, flags);
+	old = idr_find(&apr->svcs_idr, adev->svc.id);
+	if (old && old != &adev->svc)
+		ret = -EEXIST;
+	else if (!old)
+		ret = idr_alloc(&apr->svcs_idr, &adev->svc, adev->svc.id,
+				adev->svc.id + 1, GFP_ATOMIC);
+	spin_unlock_irqrestore(&apr->svcs_lock, flags);
+	return ret < 0 ? ret : 0;
+}
+
+static void apr_unregister_service(struct apr_device *adev)
+{
+	struct packet_router *apr = dev_get_drvdata(adev->dev.parent);
+	unsigned long flags;
+
+	spin_lock_irqsave(&apr->svcs_lock, flags);
+	if (idr_find(&apr->svcs_idr, adev->svc.id) == &adev->svc)
+		idr_remove(&apr->svcs_idr, adev->svc.id);
+	spin_unlock_irqrestore(&apr->svcs_lock, flags);
+	/* APR callbacks execute in a workqueue and may sleep. */
+	if (apr->type == PR_TYPE_APR)
+		synchronize_srcu(&apr->apr_srcu);
+}
+
 static int apr_device_probe(struct device *dev)
 {
 	struct apr_device *adev = to_apr_device(dev);
 	struct apr_driver *adrv = to_apr_driver(dev->driver);
 	int ret;
 
+	ret = apr_register_service(adev);
+	if (ret)
+		return ret;
 	ret = adrv->probe(adev);
-	if (!ret)
-		adev->svc.callback = adrv->gpr_callback;
-
-	return ret;
+	if (ret) {
+		apr_unregister_service(adev);
+		return ret;
+	}
+	adev->svc.callback = adrv->gpr_callback;
+	if (of_machine_is_compatible("realme,samurai"))
+		dev_info(dev, "samurai APR service registered id=%u domain=%u\n",
+			 adev->svc.id, adev->domain_id);
+	return 0;
 }
 
 static void apr_device_remove(struct device *dev)
 {
 	struct apr_device *adev = to_apr_device(dev);
 	struct apr_driver *adrv = to_apr_driver(dev->driver);
-	struct packet_router *apr = dev_get_drvdata(adev->dev.parent);
 
+	/* Remove the dispatch entry and drain existing APR callbacks first. */
+	apr_unregister_service(adev);
+	adev->svc.callback = NULL;
 	if (adrv->remove)
 		adrv->remove(adev);
-	spin_lock(&apr->svcs_lock);
-	idr_remove(&apr->svcs_idr, adev->svc.id);
-	spin_unlock(&apr->svcs_lock);
 }
 
 static int apr_uevent(const struct device *dev, struct kobj_uevent_env *env)
@@ -426,7 +473,7 @@ static int apr_add_device(struct device *dev, struct device_node *np,
 	svc->id = svc_id;
 	svc->pr = apr;
 	svc->priv = adev;
-	svc->dev = dev;
+	svc->dev = &adev->dev;
 	spin_lock_init(&svc->lock);
 
 	adev->domain_id = domain_id;
@@ -453,19 +500,14 @@ static int apr_add_device(struct device *dev, struct device_node *np,
 	adev->dev.release = apr_dev_release;
 	adev->dev.driver = NULL;
 
-	spin_lock(&apr->svcs_lock);
-	ret = idr_alloc(&apr->svcs_idr, svc, svc_id, svc_id + 1, GFP_ATOMIC);
-	spin_unlock(&apr->svcs_lock);
-	if (ret < 0) {
-		dev_err(dev, "idr_alloc failed: %d\n", ret);
-		goto out;
-	}
 
 	/* Protection domain is optional, it does not exist on older platforms */
 	ret = of_property_read_string_index(np, "qcom,protection-domain",
 					    1, &adev->service_path);
 	if (ret < 0 && ret != -EINVAL) {
 		dev_err(dev, "Failed to read second value of qcom,protection-domain\n");
+		kfree_const(adev->dev.kobj.name);
+		kfree(adev);
 		goto out;
 	}
 
@@ -631,6 +673,10 @@ static int apr_probe(struct rpmsg_device *rpdev)
 		goto destroy_wq;
 	}
 
+	ret = init_srcu_struct(&apr->apr_srcu);
+	if (ret)
+		goto handle_release;
+
 	INIT_LIST_HEAD(&apr->rx_list);
 	spin_lock_init(&apr->rx_lock);
 	spin_lock_init(&apr->svcs_lock);
@@ -638,12 +684,17 @@ static int apr_probe(struct rpmsg_device *rpdev)
 
 	ret = of_apr_add_pd_lookups(dev);
 	if (ret)
-		goto handle_release;
+		goto cleanup_srcu;
 
 	of_register_apr_devices(dev, NULL);
 
 	return 0;
 
+cleanup_srcu:
+	pdr_handle_release(apr->pdr);
+	destroy_workqueue(apr->rxwq);
+	cleanup_srcu_struct(&apr->apr_srcu);
+	return ret;
 handle_release:
 	pdr_handle_release(apr->pdr);
 destroy_wq:
@@ -658,6 +709,8 @@ static void apr_remove(struct rpmsg_device *rpdev)
 	pdr_handle_release(apr->pdr);
 	device_for_each_child(&rpdev->dev, NULL, apr_remove_device);
 	destroy_workqueue(apr->rxwq);
+	cleanup_srcu_struct(&apr->apr_srcu);
+	idr_destroy(&apr->svcs_idr);
 }
 
 /*

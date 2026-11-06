@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * L3-02 optional sensor-power board data.
+ *
+ * The driver keeps these values as defaults when the properties are absent.
+ * Keeping this overlay OS-only leaves the vendor/compat DTB unchanged.
+ */
+
+&samurai_sensor_power {
+    realme,vdd-min-microvolt = <2856000>;
+    realme,vdd-max-microvolt = <3104000>;
+    realme,vddio-min-microvolt = <1800000>;
+    realme,vddio-max-microvolt = <1800000>;
+    realme,vddio-delay-us = <10000>;
+    realme,rail-load-microamp = <200000>;
+};

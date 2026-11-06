@@ -465,6 +465,29 @@ int slim_stream_unprepare(struct slim_stream_runtime *stream)
 EXPORT_SYMBOL_GPL(slim_stream_unprepare);
 
 /**
+ * slim_stream_abort() - Discard local stream state after transport loss
+ * @stream: Stream whose device or transport has gone offline
+ *
+ * The caller serializes this with prepare and trigger operations. No bus
+ * command is sent, and no successful hardware stop is implied. A live device
+ * must use the ordinary disable/unprepare sequence instead.
+ *
+ * Return: zero after local cleanup, or -EBUSY if the device is online.
+ */
+int slim_stream_abort(struct slim_stream_runtime *stream)
+{
+	if (slim_device_is_online(stream->dev))
+		return -EBUSY;
+
+	kfree(stream->ports);
+	stream->ports = NULL;
+	stream->num_ports = 0;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(slim_stream_abort);
+
+/**
  * slim_stream_free() - Free a SLIMbus Stream
  *
  * @stream: instance of slim stream runtime to free

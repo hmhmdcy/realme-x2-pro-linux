@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Realme X2 Pro (RMX1931 / samurai), OS-facing board description.
+ *
+ * The hardware contract is DTS-only.  Debug EUD and test command lines are
+ * deliberately not part of the production board description.
+ */
+/dts-v1/;
+
+#include "sm8150-samurai-common.dtsi"
+#include "samurai-sensor-power-data.dtsi"
+
+/ {
+	chosen {
+		/delete-property/ bootargs;
+		/delete-property/ stdout-path;
+	};
+};
+
+&eud_com {
+	status = "disabled";
+};
+
+&usb_1_dwc3 {
+	status = "okay";
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+	qcom,select-utmi-as-pipe-clk;
+	phys = <&usb_1_hsphy>;
+	phy-names = "usb2-phy";
+};
+
+&usb_1_qmpphy {
+	status = "disabled";
+};

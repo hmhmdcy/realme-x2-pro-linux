@@ -57,6 +57,8 @@ static int ath10k_qmi_map_msa_permission(struct ath10k_qmi *qmi,
 				  &src_perms, dst_perms, perm_count);
 	if (ret < 0)
 		ath10k_err(ar, "failed to assign msa map permissions: %d\n", ret);
+	else
+		mem_info->mapped = true;
 
 	return ret;
 }
@@ -68,6 +70,10 @@ static int ath10k_qmi_unmap_msa_permission(struct ath10k_qmi *qmi,
 	struct ath10k *ar = qmi->ar;
 	u64 src_perms;
 	int ret;
+
+	/* A failed or partial setup must not reclaim an unassigned region. */
+	if (!mem_info->mapped)
+		return 0;
 
 	src_perms = BIT(QCOM_SCM_VMID_MSS_MSA) | BIT(QCOM_SCM_VMID_WLAN);
 
@@ -81,6 +87,8 @@ static int ath10k_qmi_unmap_msa_permission(struct ath10k_qmi *qmi,
 				  &src_perms, &dst_perms, 1);
 	if (ret < 0)
 		ath10k_err(ar, "failed to unmap msa permissions: %d\n", ret);
+	else
+		mem_info->mapped = false;
 
 	return ret;
 }
@@ -1139,6 +1147,8 @@ int ath10k_qmi_deinit(struct ath10k *ar)
 	qmi->state = ATH10K_QMI_STATE_DEINIT;
 	qmi_handle_release(&qmi->qmi_hdl);
 	cancel_work_sync(&qmi->event_work);
+	/* Unbinding while the server is alive produces no SERVER_EXIT event. */
+	ath10k_qmi_remove_msa_permission(qmi);
 	destroy_workqueue(qmi->event_wq);
 	kfree(qmi);
 	ar_snoc->qmi = NULL;

@@ -324,6 +324,15 @@ static int ath10k_install_key(struct ath10k_vif *arvif,
 	if (ret)
 		return ret;
 
+	/* WCN3990/SNOC sends no security indication for cipher-none pairwise
+	 * deletion. The WMI send above must still succeed. Group deletion
+	 * installs a random replacement key and keeps its completion wait.
+	 */
+	if (cmd == DISABLE_KEY && !(flags & WMI_KEY_GROUP) &&
+	    ar->hw_rev == ATH10K_HW_WCN3990 &&
+	    ar->hif.bus == ATH10K_BUS_SNOC)
+		return 0;
+
 	time_left = wait_for_completion_timeout(&ar->install_key_done, 3 * HZ);
 	if (time_left == 0)
 		return -ETIMEDOUT;

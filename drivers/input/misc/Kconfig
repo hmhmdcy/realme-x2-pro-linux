@@ -126,6 +126,15 @@ config INPUT_ATMEL_CAPTOUCH
 	  To compile this driver as a module, choose M here: the
 	  module will be called atmel_captouch.
 
+config INPUT_SAMURAI_AW8697
+	tristate "Realme X2 Pro AW8697 haptics candidate"
+	depends on I2C && GPIOLIB && OF
+	select REGMAP_I2C
+	select INPUT_FF_MEMLESS
+	help
+	  Bounded continuous-mode force feedback for the RMX1931 AW8697.
+	  Uses the same-handset 19781 170 Hz profile without waveform firmware.
+
 config INPUT_AW86927
 	tristate "Awinic AW86927 Haptic Driver Support"
 	depends on I2C && INPUT

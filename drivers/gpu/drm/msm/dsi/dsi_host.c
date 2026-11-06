@@ -32,6 +32,10 @@
 #include "msm_gem.h"
 #include "phy/dsi_phy.h"
 
+#define CREATE_TRACE_POINTS
+#include "msm_dsi_trace.h"
+#undef CREATE_TRACE_POINTS
+
 #define DSI_RESET_TOGGLE_DELAY_MS 20
 
 static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc_config *dsc);
@@ -185,6 +189,7 @@ struct msm_dsi_host {
 
 	bool registered;
 	bool power_on;
+	bool firmware_quiesced;
 	bool enabled;
 	int irq;
 };
@@ -928,6 +933,12 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 
 		dsi_write(msm_host, REG_DSI_LANE_CTRL,
 			lane_ctrl | DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST);
+	} else {
+		/* Clear a continuous-clock request inherited from firmware. */
+		msm_dsi_phy_set_continuous_clock(phy, false);
+		lane_ctrl = dsi_read(msm_host, REG_DSI_LANE_CTRL);
+		lane_ctrl &= ~DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST;
+		dsi_write(msm_host, REG_DSI_LANE_CTRL, lane_ctrl);
 	}
 
 	data |= DSI_CTRL_ENABLE;
@@ -1572,6 +1583,7 @@ static void dsi_err_worker(struct work_struct *work)
 		container_of(work, struct msm_dsi_host, err_work);
 	u32 status = msm_host->err_work_state;
 
+	trace_msm_dsi_error_work(msm_host->id, status, false);
 	pr_err_ratelimited("%s: status=%x\n", __func__, status);
 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
@@ -1581,6 +1593,7 @@ static void dsi_err_worker(struct work_struct *work)
 
 	/* enable dsi error interrupt */
 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
+	trace_msm_dsi_error_work(msm_host->id, status, true);
 }
 
 static void dsi_ack_err_status(struct msm_dsi_host *msm_host)
@@ -1595,6 +1608,9 @@ static void dsi_ack_err_status(struct msm_dsi_host *msm_host)
 		dsi_write(msm_host, REG_DSI_ACK_ERR_STATUS, 0);
 		msm_host->err_work_state |= DSI_ERR_STATE_ACK;
 	}
+
+	trace_msm_dsi_error_status(msm_host->id, REG_DSI_ACK_ERR_STATUS,
+				   status, msm_host->err_work_state);
 }
 
 static void dsi_timeout_status(struct msm_dsi_host *msm_host)
@@ -1607,6 +1623,9 @@ static void dsi_timeout_status(struct msm_dsi_host *msm_host)
 		dsi_write(msm_host, REG_DSI_TIMEOUT_STATUS, status);
 		msm_host->err_work_state |= DSI_ERR_STATE_TIMEOUT;
 	}
+
+	trace_msm_dsi_error_status(msm_host->id, REG_DSI_TIMEOUT_STATUS,
+				   status, msm_host->err_work_state);
 }
 
 static void dsi_dln0_phy_err(struct msm_dsi_host *msm_host)
@@ -1623,6 +1642,9 @@ static void dsi_dln0_phy_err(struct msm_dsi_host *msm_host)
 		dsi_write(msm_host, REG_DSI_DLN0_PHY_ERR, status);
 		msm_host->err_work_state |= DSI_ERR_STATE_DLN0_PHY;
 	}
+
+	trace_msm_dsi_error_status(msm_host->id, REG_DSI_DLN0_PHY_ERR,
+				   status, msm_host->err_work_state);
 }
 
 static void dsi_fifo_status(struct msm_dsi_host *msm_host)
@@ -1639,6 +1661,9 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
 			msm_host->err_work_state |=
 					DSI_ERR_STATE_MDP_FIFO_UNDERFLOW;
 	}
+
+	trace_msm_dsi_error_status(msm_host->id, REG_DSI_FIFO_STATUS,
+				   status, msm_host->err_work_state);
 }
 
 static void dsi_status(struct msm_dsi_host *msm_host)
@@ -1652,6 +1677,9 @@ static void dsi_status(struct msm_dsi_host *msm_host)
 		msm_host->err_work_state |=
 			DSI_ERR_STATE_INTERLEAVE_OP_CONTENTION;
 	}
+
+	trace_msm_dsi_error_status(msm_host->id, REG_DSI_STATUS0,
+				   status, msm_host->err_work_state);
 }
 
 static void dsi_clk_status(struct msm_dsi_host *msm_host)
@@ -1664,6 +1692,9 @@ static void dsi_clk_status(struct msm_dsi_host *msm_host)
 		dsi_write(msm_host, REG_DSI_CLK_STATUS, status);
 		msm_host->err_work_state |= DSI_ERR_STATE_PLL_UNLOCKED;
 	}
+
+	trace_msm_dsi_error_status(msm_host->id, REG_DSI_CLK_STATUS,
+				   status, msm_host->err_work_state);
 }
 
 static void dsi_error(struct msm_dsi_host *msm_host)
@@ -1697,8 +1728,10 @@ static irqreturn_t dsi_host_irq(int irq, void *ptr)
 
 	DBG("isr=0x%x, id=%d", isr, msm_host->id);
 
-	if (isr & DSI_IRQ_ERROR)
+	if (isr & DSI_IRQ_ERROR) {
+		trace_msm_dsi_error_irq(msm_host->id, isr);
 		dsi_error(msm_host);
+	}
 
 	if (isr & DSI_IRQ_VIDEO_DONE)
 		complete(&msm_host->video_comp);
@@ -2485,6 +2518,55 @@ static void msm_dsi_sfpb_config(struct msm_dsi_host *msm_host, bool enable)
 			SFPB_GPREG_MASTER_PORT_EN(en));
 }
 
+/* Called only with the host link clocks enabled, before enabling its IRQ. */
+static void dsi_log_power_on_state(struct msm_dsi_host *msm_host,
+				   const char *phase)
+{
+	dev_info(&msm_host->pdev->dev,
+		 "DSI power-on %s: CTRL=0x%x MDP2=0x%x DSC=0x%x TRIG=0x%x FIFO=0x%x\n",
+		 phase, dsi_read(msm_host, REG_DSI_CTRL),
+		 dsi_read(msm_host, REG_DSI_CMD_MODE_MDP_CTRL2),
+		 dsi_read(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL),
+		 dsi_read(msm_host, REG_DSI_TRIG_CTRL),
+		 dsi_read(msm_host, REG_DSI_FIFO_STATUS));
+}
+
+/* Quiesce firmware output before the manager reconfigures the PHY/PLL. */
+int msm_dsi_host_quiesce_firmware(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	struct device *dev = &msm_host->pdev->dev;
+	u32 before, after;
+	int ret = 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (msm_host->firmware_quiesced || msm_host->power_on)
+		goto unlock;
+
+	/* Runtime resume enables the bus clocks needed for controller MMIO. */
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		goto unlock;
+
+	before = dsi_read(msm_host, REG_DSI_CTRL);
+	dsi_ctrl_disable(msm_host);
+	wmb(); /* Stop output before the later PHY reset and PLL rate change. */
+	after = dsi_read(msm_host, REG_DSI_CTRL);
+	if (after & DSI_CTRL_ENABLE) {
+		dev_err(dev, "firmware controller stop failed: CTRL=0x%x\n", after);
+		ret = -EIO;
+	} else {
+		msm_host->firmware_quiesced = true;
+		dev_info(dev, "DSI firmware stop before PHY: CTRL=0x%x -> 0x%x\n",
+			 before, after);
+		ret = 0;
+	}
+	pm_runtime_put_sync(dev);
+unlock:
+	mutex_unlock(&msm_host->dev_mutex);
+	return ret;
+}
+
 int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 			struct msm_dsi_phy_shared_timings *phy_shared_timings,
 			bool is_bonded_dsi, struct msm_dsi_phy *phy)
@@ -2528,9 +2610,15 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		goto fail_disable_clk;
 	}
 
+	dsi_log_power_on_state(msm_host, "inherited");
+	/* Do not resume a firmware command frame while replacing its timings. */
+	dsi_ctrl_disable(msm_host);
+	wmb(); /* Stop the inherited engine before changing its stream timing. */
+
 	dsi_timing_setup(msm_host, is_bonded_dsi);
 	dsi_sw_reset(msm_host);
 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+	dsi_log_power_on_state(msm_host, "native");
 
 	msm_host->power_on = true;
 	mutex_unlock(&msm_host->dev_mutex);

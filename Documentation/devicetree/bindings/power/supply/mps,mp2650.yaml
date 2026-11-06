@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/mps,mp2650.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Monolithic Power Systems MP2650 battery charger
+
+maintainers:
+  - Samurai Linux port maintainers <samurai-linux@example.com>
+
+description: |
+  The MP2650 is an I2C battery charger. The Samurai driver currently exposes
+  read-only input voltage, input current, input presence and charging status.
+  Registering the device does not reset or configure the charger. Board charge
+  policy, input power budgets and protection must be handled separately.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: mps,mp2650
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@5c {
+            compatible = "mps,mp2650";
+            reg = <0x5c>;
+        };
+    };

@@ -372,6 +372,8 @@ struct slim_stream_runtime {
  * @wakeup: This function pointer implements controller-specific procedure
  *	to wake it up from clock-pause. Framework will call this to bring
  *	the controller out of clock pause.
+ * @is_online: Optional non-sleeping transport availability query. Sleeping
+ *	controllers remain online if normal runtime resume can reach the device.
  * @enable_stream: This function pointer implements controller-specific procedure
  *	to enable a stream.
  * @disable_stream: This function pointer implements controller-specific procedure
@@ -417,6 +419,7 @@ struct slim_controller {
 					     struct slim_eaddr *ea, u8 laddr);
 	int			(*get_laddr)(struct slim_controller *ctrl,
 					     struct slim_eaddr *ea, u8 *laddr);
+	bool		(*is_online)(struct slim_controller *ctrl);
 	int		(*enable_stream)(struct slim_stream_runtime *rt);
 	int		(*disable_stream)(struct slim_stream_runtime *rt);
 	int			(*wakeup)(struct slim_controller *ctrl);
@@ -424,7 +427,6 @@ struct slim_controller {
 
 int slim_device_report_present(struct slim_controller *ctrl,
 			       struct slim_eaddr *e_addr, u8 *laddr);
-void slim_report_absent(struct slim_device *sbdev);
 int slim_register_controller(struct slim_controller *ctrl);
 int slim_unregister_controller(struct slim_controller *ctrl);
 void slim_msg_response(struct slim_controller *ctrl, u8 *reply, u8 tid, u8 l);

@@ -1435,6 +1435,9 @@ int wcd_mbhc_start(struct wcd_mbhc *mbhc, struct wcd_mbhc_config *cfg,
 {
 	if (!mbhc || !cfg || !jack)
 		return -EINVAL;
+	/* ADC threshold scaling uses this voltage as a divisor. */
+	if ((cfg->hs_thr || cfg->hph_thr) && !cfg->micb_mv)
+		return -EINVAL;
 
 	mbhc->cfg = cfg;
 	mbhc->jack = jack;
@@ -1490,7 +1493,7 @@ int wcd_dt_parse_mbhc_data(struct device *dev, struct wcd_mbhc_config *cfg)
 
 	for (i = 0; i < WCD_MBHC_DEF_BUTTONS; i++) {
 		if (ret) /* default voltage */
-			cfg->btn_high[i] = 500000;
+			cfg->btn_high[i] = 500;
 		else
 			/* Micro to Milli Volts */
 			cfg->btn_high[i] = cfg->btn_high[i]/1000;

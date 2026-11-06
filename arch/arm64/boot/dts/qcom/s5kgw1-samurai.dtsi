@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Board19781 primary sensor: OEM slot0/address0x20 (7-bit 0x10), CSIPHY0. */
+&cam_pmic_q {
+	regulators {
+		cam_main_vdig: ldo1 {
+			regulator-name = "cam-main-vdig";
+			regulator-min-microvolt = <1100000>;
+			regulator-max-microvolt = <1104000>;
+			regulator-enable-ramp-delay = <1000>;
+		};
+		cam_main_vaf: ldo3 {
+			regulator-name = "cam-main-vaf";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-enable-ramp-delay = <1000>;
+		};
+		cam_main_vana: ldo7 {
+			regulator-name = "cam-main-vana";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-enable-ramp-delay = <1000>;
+		};
+	};
+};
+
+&pm8150_gpios {
+	cam_main_reset: camera-main-reset-state {
+		pins = "gpio1";
+		function = "normal";
+		power-source = <0>;
+		bias-disable;
+	};
+};
+
+&tlmm {
+	cam_main_mclk_active: camera-main-mclk-active-state {
+		pins = "gpio13";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+	cam_main_mclk_sleep: camera-main-mclk-sleep-state {
+		pins = "gpio13";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+};
+
+&cci0_i2c0 {
+	status = "okay";
+	cam_main_lens: lens@72 {
+		compatible = "onnn,lc898219xi";
+		reg = <0x72>;
+		vdd-supply = <&cam_main_vaf>;
+	};
+
+	cam_main: camera@10 {
+		compatible = "samsung,s5kgw1";
+		reg = <0x10>;
+		orientation = <1>;
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+		vdda-supply = <&cam_main_vana>;
+		vddd-supply = <&cam_main_vdig>;
+		vddio-supply = <&vreg_l1c_1p8>;
+		lens-focus = <&cam_main_lens>;
+		clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clock-rates = <19200000>;
+		reset-gpios = <&pm8150_gpios 1 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_main_mclk_active &cam_main_reset>;
+		pinctrl-1 = <&cam_main_mclk_sleep &cam_main_reset>;
+		port {
+			cam_main_ep: endpoint {
+				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
+				data-lanes = <0 1 2>;
+				/* OP PLL timing candidate; native capture still required. */
+				link-frequencies = /bits/ 64 <499200000>;
+				remote-endpoint = <&cam_main_csiphy0_ep>;
+			};
+		};
+	};
+};
+
+&camss {
+	ports {
+		port@0 {
+			reg = <0>;
+			cam_main_csiphy0_ep: endpoint {
+				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
+				data-lanes = <0 1 2>;
+				remote-endpoint = <&cam_main_ep>;
+			};
+		};
+	};
+};

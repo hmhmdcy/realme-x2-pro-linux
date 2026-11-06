@@ -695,6 +695,14 @@ config CHARGER_MAX8998
 	  Say Y to enable support for the battery charger control sysfs and
 	  platform data of MAX8998/LP3974 PMICs.
 
+config CHARGER_MP2650
+	tristate "Monolithic Power Systems MP2650 input/status support"
+	depends on I2C
+	help
+	  Observe MP2650 input availability, voltage, current and charge
+	  termination through power_supply. Configuration is inherited;
+	  this does not enable charging control or modify hardware protection.
+
 config CHARGER_MP2629
 	tristate "Monolithic power system MP2629 Battery charger"
 	depends on MFD_MP2629

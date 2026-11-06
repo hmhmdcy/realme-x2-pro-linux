@@ -132,4 +132,12 @@ struct dpu_hw_intf *dpu_hw_intf_init(struct drm_device *dev,
 				     void __iomem *addr,
 				     const struct dpu_mdss_version *mdss_rev);
 
+/**
+ * dpu_hw_intf_clear_boot_config() - stop inherited SM8150 DSI frame requests
+ * @intf: DPU 5 DSI interface, with clocks enabled
+ *
+ * Return: 0 on success or a negative error if the inherited frame cannot drain.
+ */
+int dpu_hw_intf_clear_boot_config(struct dpu_hw_intf *intf);
+
 #endif /*_DPU_HW_INTF_H */

@@ -33,6 +33,7 @@
 #include "dpu_formats.h"
 #include "dpu_hw_vbif.h"
 #include "dpu_kms.h"
+#include <drm/drm_bridge.h>
 #include "dpu_plane.h"
 #include "dpu_vbif.h"
 #include "dpu_writeback.h"
@@ -402,7 +403,11 @@ static const struct drm_private_state_funcs dpu_kms_global_state_funcs = {
 
 static void dpu_kms_global_obj_fini(struct dpu_kms *dpu_kms)
 {
+	if (!dpu_kms->global_state_initialized)
+		return;
+
 	drm_atomic_private_obj_fini(&dpu_kms->global_state);
+	dpu_kms->global_state_initialized = false;
 }
 
 static int dpu_kms_parse_data_bus_icc_path(struct dpu_kms *dpu_kms)
@@ -476,6 +481,36 @@ static void dpu_kms_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
 	}
 }
 
+static void dpu_kms_first_frame_backlight(struct drm_crtc *crtc)
+{
+	struct drm_encoder *encoder;
+	bool needs_first_frame;
+	int ret;
+
+	if (!crtc->state->enable || !drm_atomic_crtc_effectively_active(crtc->state))
+		return;
+
+	drm_for_each_encoder_mask(encoder, crtc->dev, crtc->state->encoder_mask) {
+		needs_first_frame = false;
+		drm_for_each_bridge_in_chain(encoder, bridge) {
+			if (drm_panel_bridge_needs_first_frame(bridge))
+				needs_first_frame = true;
+		}
+		if (!needs_first_frame)
+			continue;
+
+		/* CTL start can precede pp_done: wait until all pixels reach GRAM. */
+		ret = dpu_encoder_wait_for_tx_complete(encoder);
+		trace_dpu_first_frame_backlight(DRMID(crtc), DRMID(encoder), ret);
+		if (ret && ret != -EWOULDBLOCK) {
+			DPU_ERROR("first frame TX failed: %d; backlight stays blank\n", ret);
+			continue;
+		}
+		drm_for_each_bridge_in_chain(encoder, bridge)
+			drm_panel_bridge_first_frame_done(bridge);
+	}
+}
+
 static void dpu_kms_complete_commit(struct msm_kms *kms, unsigned crtc_mask)
 {
 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
@@ -483,8 +518,10 @@ static void dpu_kms_complete_commit(struct msm_kms *kms, unsigned crtc_mask)
 
 	DPU_ATRACE_BEGIN("kms_complete_commit");
 
-	for_each_crtc_mask(dpu_kms->dev, crtc, crtc_mask)
+	for_each_crtc_mask(dpu_kms->dev, crtc, crtc_mask) {
+		dpu_kms_first_frame_backlight(crtc);
 		dpu_crtc_complete_commit(crtc);
+	}
 
 	DPU_ATRACE_END("kms_complete_commit");
 }
@@ -1135,6 +1172,21 @@ unsigned long dpu_kms_get_clk_rate(struct dpu_kms *dpu_kms, char *clock_name)
 
 #define	DPU_PERF_DEFAULT_MAX_CORE_CLK_RATE	412500000
 
+static int dpu_kms_quiesce_boot_dsi(struct msm_kms *kms)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(kms->dsi); i++) {
+		if (!kms->dsi[i])
+			continue;
+		ret = msm_dsi_quiesce_firmware(kms->dsi[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int dpu_kms_hw_init(struct msm_kms *kms)
 {
 	struct dpu_kms *dpu_kms;
@@ -1156,6 +1208,7 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 
 	drm_atomic_private_obj_init(dpu_kms->dev, &dpu_kms->global_state,
 				    &dpu_kms_global_state_funcs);
+	dpu_kms->global_state_initialized = true;
 
 	atomic_set(&dpu_kms->bandwidth_ref, 0);
 
@@ -1178,12 +1231,6 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	 * Now we need to read the HW catalog and initialize resources such as
 	 * clocks, regulators, GDSC/MMAGIC, ioremap the register ranges etc
 	 */
-	rc = _dpu_kms_mmu_init(dpu_kms);
-	if (rc) {
-		DPU_ERROR("dpu_kms_mmu_init failed: %d\n", rc);
-		goto err_pm_put;
-	}
-
 	dpu_kms->mdss = qcom_ubwc_config_get_data();
 	if (IS_ERR(dpu_kms->mdss)) {
 		rc = PTR_ERR(dpu_kms->mdss);
@@ -1200,6 +1247,27 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	rc = dpu_rm_init(dev, &dpu_kms->rm, dpu_kms->catalog, dpu_kms->mdss, dpu_kms->mmio);
 	if (rc) {
 		DPU_ERROR("rm init failed: %d\n", rc);
+		goto err_pm_put;
+	}
+
+	/* The boot framebuffer uses physical addresses in the identity domain. */
+	if (of_device_is_compatible(dev->dev->of_node, "qcom,sm8150-dpu")) {
+		/* Stop the firmware DSI consumer before resetting its CTL producer. */
+		rc = dpu_kms_quiesce_boot_dsi(kms);
+		if (rc) {
+			DPU_ERROR("DSI firmware stop failed: %d\n", rc);
+			goto err_pm_put;
+		}
+		rc = dpu_rm_clear_boot_config(&dpu_kms->rm, dpu_kms->catalog);
+		if (rc) {
+			DPU_ERROR("boot CTL shutdown failed: %d\n", rc);
+			goto err_pm_put;
+		}
+	}
+
+	rc = _dpu_kms_mmu_init(dpu_kms);
+	if (rc) {
+		DPU_ERROR("dpu_kms_mmu_init failed: %d\n", rc);
 		goto err_pm_put;
 	}
 

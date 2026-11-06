@@ -6,6 +6,7 @@
 #include <linux/device.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
+#include <linux/freezer.h>
 #include <linux/dma-resv.h>
 #include <linux/idr.h>
 #include <linux/list.h>
@@ -19,6 +20,7 @@
 #include <linux/rpmsg.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <uapi/misc/fastrpc.h>
 #include <linux/of_reserved_mem.h>
@@ -307,6 +309,11 @@ struct fastrpc_channel_ctx {
 	int vmcount;
 	struct qcom_scm_vmperm vmperms[FASTRPC_MAX_VMIDS];
 	struct rpmsg_device *rpdev;
+	struct device *dev;
+	u64 *original_dma_mask;
+	u64 original_coherent_dma_mask;
+	/* Protected by lock; all misc nodes must exist before opening. */
+	bool ready;
 	struct fastrpc_session_ctx session[FASTRPC_MAX_SESSIONS];
 	spinlock_t lock;
 	struct idr ctx_idr;
@@ -1099,7 +1106,7 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 
 	ctx->msg_sz = pkt_size;
 
-	if (ctx->fl->sctx->sid)
+	if (ctx->fl->sctx->sid && ctx->fl->pd != SENSORS_PD)
 		err = fastrpc_buf_alloc(ctx->fl, dev, pkt_size, &ctx->buf);
 	else
 		err = fastrpc_remote_heap_alloc(ctx->fl, dev, pkt_size, &ctx->buf);
@@ -1326,7 +1333,11 @@ static inline int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 		if (!wait_for_completion_timeout(&ctx->work, 10 * HZ))
 			err = -ETIMEDOUT;
 	} else {
-		err = wait_for_completion_interruptible(&ctx->work);
+		/* Keep this RPC and its DMA buffers while the invoking task freezes. */
+		do {
+			err = wait_for_completion_state(&ctx->work,
+							TASK_INTERRUPTIBLE | TASK_FREEZABLE);
+		} while (err == -ERESTARTSYS && try_to_freeze());
 	}
 
 	return err;
@@ -1685,15 +1696,13 @@ err:
 	return err;
 }
 
-static struct fastrpc_session_ctx *fastrpc_session_alloc(
-					struct fastrpc_user *fl)
+static struct fastrpc_session_ctx *fastrpc_session_alloc_locked(struct fastrpc_user *fl)
 {
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	struct fastrpc_session_ctx *session = NULL;
-	unsigned long flags;
 	int i;
 
-	spin_lock_irqsave(&cctx->lock, flags);
+	lockdep_assert_held(&cctx->lock);
 	for (i = 0; i < cctx->sesscount; i++) {
 		if (!cctx->session[i].used && cctx->session[i].valid) {
 			cctx->session[i].used = true;
@@ -1703,7 +1712,6 @@ static struct fastrpc_session_ctx *fastrpc_session_alloc(
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	return session;
 }
@@ -1758,8 +1766,9 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 {
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_device *fdevice;
-	struct fastrpc_user *fl = NULL;
+	struct fastrpc_user *fl;
 	unsigned long flags;
+	int err;
 
 	fdevice = miscdev_to_fdevice(filp->private_data);
 	cctx = fdevice->cctx;
@@ -1768,34 +1777,42 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	if (!fl)
 		return -ENOMEM;
 
-	/* Released in fastrpc_device_release() */
-	fastrpc_channel_ctx_get(cctx);
-
-	filp->private_data = fl;
 	spin_lock_init(&fl->lock);
 	mutex_init(&fl->mutex);
 	INIT_LIST_HEAD(&fl->pending);
 	INIT_LIST_HEAD(&fl->maps);
 	INIT_LIST_HEAD(&fl->mmaps);
 	INIT_LIST_HEAD(&fl->user);
+	kref_init(&fl->refcount);
 	fl->cctx = cctx;
 	fl->is_secure_dev = fdevice->secure;
 
-	fl->sctx = fastrpc_session_alloc(fl);
-	if (!fl->sctx) {
-		dev_err(&cctx->rpdev->dev, "No session available\n");
-		mutex_destroy(&fl->mutex);
-		kfree(fl);
-		fastrpc_channel_ctx_put(cctx);
-		return -EBUSY;
+	/* misc_open() holds misc_mtx, so the device and owner ref are live. */
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (!cctx->ready || !cctx->rpdev) {
+		err = -ENODEV;
+		goto err_unlock;
 	}
 
-	spin_lock_irqsave(&cctx->lock, flags);
+	fl->sctx = fastrpc_session_alloc_locked(fl);
+	if (!fl->sctx) {
+		err = -EBUSY;
+		goto err_unlock;
+	}
+
+	/* Released by fastrpc_user_free(), after the last user reference. */
+	fastrpc_channel_ctx_get(cctx);
 	list_add_tail(&fl->user, &cctx->users);
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	kref_init(&fl->refcount);
+	filp->private_data = fl;
 
 	return 0;
+
+err_unlock:
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	mutex_destroy(&fl->mutex);
+	kfree(fl);
+	return err;
 }
 
 static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
@@ -2357,6 +2374,7 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 }
 
 static const struct file_operations fastrpc_fops = {
+	.owner = THIS_MODULE,
 	.open = fastrpc_device_open,
 	.release = fastrpc_device_release,
 	.unlocked_ioctl = fastrpc_device_ioctl,
@@ -2533,6 +2551,19 @@ static const struct of_device_id fastrpc_poll_supported_machines[] __maybe_unuse
 	{},
 };
 
+/* Runs after endpoint destruction and child/device resource cleanup. */
+static void fastrpc_channel_ctx_release(void *data)
+{
+	struct fastrpc_channel_ctx *cctx = data;
+	struct device *dev = cctx->dev;
+
+	/* Pair with callback acquire readers after endpoint destruction. */
+	smp_store_release(&dev->driver_data, NULL);
+	dev->dma_mask = cctx->original_dma_mask;
+	dev->coherent_dma_mask = cctx->original_coherent_dma_mask;
+	fastrpc_channel_ctx_put(cctx);
+}
+
 static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 {
 	struct device *rdev = &rpdev->dev;
@@ -2541,6 +2572,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	const char *domain;
 	bool secure_dsp;
 	unsigned int vmids[FASTRPC_MAX_VMIDS];
+	unsigned long flags;
 	const struct fastrpc_soc_data *soc_data;
 
 	soc_data = device_get_match_data(rdev);
@@ -2572,6 +2604,29 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	if (!data)
 		return -ENOMEM;
 
+	kref_init(&data->refcount);
+	atomic_set(&data->ctx_seq, 0);
+	INIT_LIST_HEAD(&data->users);
+	INIT_LIST_HEAD(&data->invoke_interrupted_mmaps);
+	spin_lock_init(&data->lock);
+	idr_init(&data->ctx_idr);
+	data->domain_id = domain_id;
+	data->rpdev = rpdev;
+	data->dev = rdev;
+	data->original_dma_mask = rdev->dma_mask;
+	data->original_coherent_dma_mask = rdev->coherent_dma_mask;
+	secure_dsp = !of_property_read_bool(rdev->of_node, "qcom,non-secure-domain");
+	data->secure = secure_dsp;
+	data->soc_data = soc_data;
+	data->poll_mode_supported = soc_data->poll_mode_supported ||
+		of_machine_get_match(fastrpc_poll_supported_machines);
+	data->unsigned_support = domain_id == CDSP_DOMAIN_ID || domain_id == GDSP_DOMAIN_ID;
+
+	/* RPMsg destroys the endpoint before driver core releases devres. */
+	err = devm_add_action_or_reset(rdev, fastrpc_channel_ctx_release, data);
+	if (err)
+		return err;
+
 	if (vmcount) {
 		data->vmcount = vmcount;
 		for (i = 0; i < data->vmcount; i++) {
@@ -2591,34 +2646,37 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 			err = qcom_scm_assign_mem(res.start, resource_size(&res), &src_perms,
 				    data->vmperms, data->vmcount);
 			if (err)
-				goto err_free_data;
+				return err;
 		}
 
 	}
 
-	secure_dsp = !(of_property_read_bool(rdev->of_node, "qcom,non-secure-domain"));
-	data->secure = secure_dsp;
-	data->soc_data = soc_data;
-	data->poll_mode_supported = soc_data->poll_mode_supported ||
-		of_machine_get_match(fastrpc_poll_supported_machines);
+	rdev->dma_mask = &data->dma_mask;
+	err = dma_set_mask_and_coherent(rdev, DMA_BIT_MASK(32));
+	if (err)
+		return err;
+
+	/* The endpoint can receive callbacks before probe returns. */
+	smp_store_release(&rdev->driver_data, data);
+	err = of_platform_populate(rdev->of_node, NULL, NULL, rdev);
+	if (err)
+		goto err_depopulate;
 
 	switch (domain_id) {
 	case ADSP_DOMAIN_ID:
 	case MDSP_DOMAIN_ID:
 	case SDSP_DOMAIN_ID:
 		/* Unsigned PD offloading is only supported on CDSP and GDSP */
-		data->unsigned_support = false;
 		err = fastrpc_device_register(rdev, data, secure_dsp, domain);
 		if (err)
-			goto err_free_data;
+			goto err_deregister_fdev;
 		break;
 	case CDSP_DOMAIN_ID:
 	case GDSP_DOMAIN_ID:
-		data->unsigned_support = true;
 		/* Create both device nodes so that we can allow both Signed and Unsigned PD */
 		err = fastrpc_device_register(rdev, data, true, domain);
 		if (err)
-			goto err_free_data;
+			goto err_deregister_fdev;
 
 		err = fastrpc_device_register(rdev, data, false, domain);
 		if (err)
@@ -2626,26 +2684,12 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		break;
 	default:
 		err = -EINVAL;
-		goto err_free_data;
+		goto err_deregister_fdev;
 	}
 
-	kref_init(&data->refcount);
-	atomic_set(&data->ctx_seq, 0);
-
-	rdev->dma_mask = &data->dma_mask;
-	dma_set_mask_and_coherent(rdev, DMA_BIT_MASK(32));
-	INIT_LIST_HEAD(&data->users);
-	INIT_LIST_HEAD(&data->invoke_interrupted_mmaps);
-	spin_lock_init(&data->lock);
-	idr_init(&data->ctx_idr);
-	data->domain_id = domain_id;
-	data->rpdev = rpdev;
-	dev_set_drvdata(&rpdev->dev, data);
-
-	err = of_platform_populate(rdev->of_node, NULL, NULL, rdev);
-	if (err)
-		goto err_deregister_fdev;
-
+	spin_lock_irqsave(&data->lock, flags);
+	data->ready = true;
+	spin_unlock_irqrestore(&data->lock, flags);
 	return 0;
 
 err_deregister_fdev:
@@ -2653,9 +2697,11 @@ err_deregister_fdev:
 		misc_deregister(&data->fdevice->miscdev);
 	if (data->secure_fdevice)
 		misc_deregister(&data->secure_fdevice->miscdev);
-
-err_free_data:
-	kfree(data);
+err_depopulate:
+	of_platform_depopulate(rdev);
+	/* Unpublish from callback acquire readers; devm still owns the channel. */
+	smp_store_release(&rdev->driver_data, NULL);
+	/* The devm action retains the owner ref until endpoint callbacks drain. */
 	return err;
 }
 
@@ -2680,6 +2726,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 
 	/* No invocations past this point */
 	spin_lock_irqsave(&cctx->lock, flags);
+	cctx->ready = false;
 	cctx->rpdev = NULL;
 	list_for_each_entry(user, &cctx->users, user)
 		fastrpc_notify_users(user);
@@ -2698,14 +2745,14 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 		fastrpc_buf_free(cctx->remote_heap);
 
 	of_platform_depopulate(&rpdev->dev);
-
-	fastrpc_channel_ctx_put(cctx);
+	/* Stop publishing to callback acquire readers; devm retains the owner. */
+	smp_store_release(&rpdev->dev.driver_data, NULL);
 }
 
 static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 				  int len, void *priv, u32 addr)
 {
-	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
+	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_invoke_rsp *rsp = data;
 	struct fastrpc_invoke_ctx *ctx;
 	unsigned long flags;
@@ -2714,6 +2761,8 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	if (len < sizeof(*rsp))
 		return -EINVAL;
 
+	/* Pair with probe publication of the initialized channel. */
+	cctx = smp_load_acquire(&rpdev->dev.driver_data);
 	if (!cctx)
 		return -ENODEV;
 
@@ -2728,6 +2777,10 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	ctxid = FIELD_GET(FASTRPC_CTXID_MASK, rsp->ctx);
 
 	spin_lock_irqsave(&cctx->lock, flags);
+	if (!cctx->ready || !cctx->rpdev) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		return -ENODEV;
+	}
 	ctx = idr_find(&cctx->ctx_idr, ctxid);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
@@ -2807,8 +2860,8 @@ module_init(fastrpc_init);
 
 static void fastrpc_exit(void)
 {
-	platform_driver_unregister(&fastrpc_cb_driver);
 	unregister_rpmsg_driver(&fastrpc_driver);
+	platform_driver_unregister(&fastrpc_cb_driver);
 }
 module_exit(fastrpc_exit);
 

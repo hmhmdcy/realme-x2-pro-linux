@@ -5,6 +5,15 @@
 
 menu "Misc devices"
 
+config SAMURAI_SENSOR_POWER
+    bool "Realme X2 Pro SLPI sensor supply sequencer"
+    depends on ARCH_QCOM && OF && REGULATOR && REMOTEPROC && SYSFS
+    help
+      Board-specific VDD/VDDIO sequencing for the SLPI sensor subsystem.
+      Regulators follow the generic remoteproc prepare/unprepare lifecycle;
+      userspace only observes the state through a read-only attribute.
+
+
 config SENSORS_LIS3LV02D
 	tristate
 	depends on INPUT
