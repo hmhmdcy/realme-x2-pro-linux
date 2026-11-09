@@ -30,11 +30,13 @@ struct csiphy_lane {
 
 /**
  * struct csiphy_lanes_cfg - CSIPHY lanes configuration
- * @num_data: number of data lanes
+ * @is_cphy: C-PHY trio encoding
+ * @num_data: number of data lanes or trios
  * @data:     data lanes configuration
  * @clk:      clock lane configuration (only for D-PHY)
  */
 struct csiphy_lanes_cfg {
+	bool is_cphy;
 	int num_data;
 	struct csiphy_lane *data;
 	struct csiphy_lane clk;
@@ -91,6 +93,8 @@ struct csiphy_subdev_resources {
 struct csiphy_device_regs {
 	const struct csiphy_lane_regs *lane_regs;
 	int lane_array_size;
+	const struct csiphy_lane_regs *cphy_regs[3];
+	int cphy_array_size;
 	u32 offset;
 	u32 common_status_offset;
 };

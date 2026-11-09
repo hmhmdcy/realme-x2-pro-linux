@@ -4,6 +4,11 @@
 #include <linux/acpi.h>
 #include <linux/clk.h>
 #include <linux/i2c.h>
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/of.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/regulator/consumer.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/unaligned.h>
@@ -86,12 +91,17 @@ struct imx319_reg_list {
 	const struct imx319_reg *regs;
 };
 
+/* Full unbinned register-list readout coordinate space. */
+#define IMX319_NATIVE_WIDTH	3280
+#define IMX319_NATIVE_HEIGHT	2464
+
 /* Mode : resolution and related config&values */
 struct imx319_mode {
 	/* Frame width */
 	u32 width;
 	/* Frame height */
 	u32 height;
+	struct v4l2_rect analogue_crop;
 
 	/* V-timing */
 	u32 fll_def;
@@ -111,8 +121,27 @@ struct imx319_hwcfg {
 	unsigned long link_freq_bitmap;
 };
 
+struct imx319_profile {
+	const struct imx319_mode *modes;
+	unsigned int num_modes;
+	const struct imx319_reg_list *global_setting;
+	const s64 *link_freqs;
+	unsigned int num_link_freqs;
+	u64 pixel_rate;
+};
+
 struct imx319 {
 	struct device *dev;
+	const struct imx319_profile *profile;
+	struct clk *clk;
+	struct gpio_desc *reset_gpio;
+	struct regulator *vana, *vdig, *vif;
+	bool managed_power;
+	bool vana_enabled, vdig_enabled, vif_enabled, clock_enabled;
+	bool power_fault;
+	bool removing;
+	/* Exactly one owned runtime-PM reference while streaming is true. */
+	bool streaming;
 
 	struct v4l2_subdev sd;
 	struct media_pad pad;
@@ -1668,6 +1697,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 3280,
 		.height = 2464,
+		.analogue_crop = {
+			.left = 0, .top = 0,
+			.width = 3280, .height = 2464,
+		},
 		.fll_def = 3242,
 		.fll_min = 3242,
 		.llp = 3968,
@@ -1680,6 +1713,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 3264,
 		.height = 2448,
+		.analogue_crop = {
+			.left = 0, .top = 0,
+			.width = 3280, .height = 2464,
+		},
 		.fll_def = 3242,
 		.fll_min = 3242,
 		.llp = 3968,
@@ -1692,6 +1729,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 1936,
 		.height = 1096,
+		.analogue_crop = {
+			.left = 0, .top = 684,
+			.width = 3280, .height = 1096,
+		},
 		.fll_def = 3242,
 		.fll_min = 3242,
 		.llp = 3968,
@@ -1704,6 +1745,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 1920,
 		.height = 1080,
+		.analogue_crop = {
+			.left = 0, .top = 692,
+			.width = 3280, .height = 1080,
+		},
 		.fll_def = 3242,
 		.fll_min = 3242,
 		.llp = 3968,
@@ -1716,6 +1761,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 1640,
 		.height = 1232,
+		.analogue_crop = {
+			.left = 0, .top = 0,
+			.width = 3280, .height = 2464,
+		},
 		.fll_def = 5146,
 		.fll_min = 5146,
 		.llp = 2500,
@@ -1728,6 +1777,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 1640,
 		.height = 922,
+		.analogue_crop = {
+			.left = 0, .top = 304,
+			.width = 3280, .height = 1856,
+		},
 		.fll_def = 5146,
 		.fll_min = 5146,
 		.llp = 2500,
@@ -1740,6 +1793,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 1296,
 		.height = 736,
+		.analogue_crop = {
+			.left = 0, .top = 496,
+			.width = 3280, .height = 1472,
+		},
 		.fll_def = 5146,
 		.fll_min = 5146,
 		.llp = 2500,
@@ -1752,6 +1809,10 @@ static const struct imx319_mode supported_modes[] = {
 	{
 		.width = 1280,
 		.height = 720,
+		.analogue_crop = {
+			.left = 0, .top = 512,
+			.width = 3280, .height = 1440,
+		},
 		.fll_def = 5146,
 		.fll_min = 5146,
 		.llp = 2500,
@@ -1763,10 +1824,177 @@ static const struct imx319_mode supported_modes[] = {
 	},
 };
 
+#include "imx319-222mhz-tables.h"
+
+static const struct imx319_reg_list imx319_222mhz_global_setting = {
+	.regs = imx319_222mhz_global_regs,
+	.num_of_regs = ARRAY_SIZE(imx319_222mhz_global_regs),
+};
+static const struct imx319_mode imx319_222mhz_modes[] = {
+	{
+		.width = 1632, .height = 1224,
+		.analogue_crop = {
+			.left = 0, .top = 8,
+			.width = 3280, .height = 2448,
+		},
+		.fll_def = 3350, .fll_min = 3350, .llp = 2080,
+		.link_freq_index = 0,
+		.reg_list = { ARRAY_SIZE(imx319_222mhz_mode_regs), imx319_222mhz_mode_regs },
+	},
+};
+/* Firmware/PLL-derived rates, to be checked against native SOF timestamps. */
+static const s64 imx319_222mhz_link_freqs[] = { 222000000 };
+static const struct imx319_profile imx319_482mhz_profile = {
+	.modes = supported_modes, .num_modes = ARRAY_SIZE(supported_modes),
+	.global_setting = &imx319_global_setting,
+	.link_freqs = link_freq_menu_items, .num_link_freqs = ARRAY_SIZE(link_freq_menu_items),
+	.pixel_rate = IMX319_LINK_FREQ_DEFAULT * 2 * 4 / 10,
+};
+static const struct imx319_profile imx319_222mhz_profile = {
+	.modes = imx319_222mhz_modes, .num_modes = ARRAY_SIZE(imx319_222mhz_modes),
+	.global_setting = &imx319_222mhz_global_setting,
+	.link_freqs = imx319_222mhz_link_freqs, .num_link_freqs = ARRAY_SIZE(imx319_222mhz_link_freqs),
+	.pixel_rate = 209066666,
+};
+
 static inline struct imx319 *to_imx319(struct v4l2_subdev *_sd)
 {
 	return container_of(_sd, struct imx319, sd);
 }
+
+/* Standard regulator consumers supply dependency ordering. */
+static int imx319_get_power_resources(struct imx319 *imx319)
+{
+	struct device *dev = imx319->dev;
+
+	if (!dev->of_node)
+		return 0;
+	imx319->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(imx319->reset_gpio))
+		return PTR_ERR(imx319->reset_gpio);
+	imx319->vana = devm_regulator_get_optional(dev, "vana");
+	if (IS_ERR(imx319->vana))
+		return PTR_ERR(imx319->vana);
+	imx319->vdig = devm_regulator_get_optional(dev, "vdig");
+	if (IS_ERR(imx319->vdig))
+		return PTR_ERR(imx319->vdig);
+	imx319->vif = devm_regulator_get_optional(dev, "vif");
+	if (IS_ERR(imx319->vif))
+		return PTR_ERR(imx319->vif);
+	imx319->managed_power = true;
+	return 0;
+}
+
+static int imx319_power_off(struct imx319 *imx319)
+{
+	int ret, first = 0;
+
+	if (!imx319->managed_power)
+		return 0;
+	if (imx319->clock_enabled) {
+		clk_disable_unprepare(imx319->clk);
+		imx319->clock_enabled = false;
+	}
+	usleep_range(1000, 1100);
+	ret = gpiod_set_value_cansleep(imx319->reset_gpio, 1);
+	if (ret)
+		first = ret;
+	imx319->identified = false;
+	usleep_range(1000, 1100);
+	if (imx319->vif_enabled) {
+		ret = regulator_disable(imx319->vif);
+		if (!ret)
+			imx319->vif_enabled = false;
+		else if (!first)
+			first = ret;
+	}
+	if (imx319->vdig_enabled) {
+		ret = regulator_disable(imx319->vdig);
+		if (!ret)
+			imx319->vdig_enabled = false;
+		else if (!first)
+			first = ret;
+	}
+	if (imx319->vana_enabled) {
+		ret = regulator_disable(imx319->vana);
+		if (!ret)
+			imx319->vana_enabled = false;
+		else if (!first)
+			first = ret;
+	}
+	ret = pinctrl_pm_select_sleep_state(imx319->dev);
+	if (ret && !first)
+		first = ret;
+	if (first)
+		imx319->power_fault = true;
+	return first;
+}
+
+static int imx319_power_on(struct imx319 *imx319)
+{
+	int ret, cleanup_ret;
+
+	if (!imx319->managed_power)
+		return 0;
+	if (imx319->power_fault || imx319->vana_enabled || imx319->vdig_enabled ||
+	    imx319->vif_enabled || imx319->clock_enabled)
+		return -EIO;
+	ret = pinctrl_pm_select_default_state(imx319->dev);
+	if (ret) {
+		imx319->power_fault = true;
+		return ret;
+	}
+	ret = gpiod_set_value_cansleep(imx319->reset_gpio, 1);
+	if (ret) {
+		imx319->power_fault = true;
+		return ret;
+	}
+	usleep_range(1000, 1100);
+	ret = regulator_enable(imx319->vana);
+	if (ret)
+		goto failed;
+	imx319->vana_enabled = true;
+	usleep_range(1000, 1100);
+	ret = regulator_enable(imx319->vdig);
+	if (ret)
+		goto failed;
+	imx319->vdig_enabled = true;
+	usleep_range(1000, 1100);
+	ret = regulator_enable(imx319->vif);
+	if (ret)
+		goto failed;
+	imx319->vif_enabled = true;
+	ret = clk_prepare_enable(imx319->clk);
+	if (ret)
+		goto failed;
+	imx319->clock_enabled = true;
+	usleep_range(1000, 1100);
+	ret = gpiod_set_value_cansleep(imx319->reset_gpio, 0);
+	if (ret)
+		goto failed;
+	usleep_range(18000, 19000);
+	return 0;
+failed:
+	imx319->power_fault = true;
+	cleanup_ret = imx319_power_off(imx319);
+	if (cleanup_ret)
+		dev_err(imx319->dev, "power rollback incomplete: %d\n", cleanup_ret);
+	return ret;
+}
+
+static int imx319_runtime_resume(struct device *dev)
+{
+	return imx319_power_on(to_imx319(dev_get_drvdata(dev)));
+}
+
+static int imx319_runtime_suspend(struct device *dev)
+{
+	return imx319_power_off(to_imx319(dev_get_drvdata(dev)));
+}
+
+static const struct dev_pm_ops imx319_pm_ops = {
+	SET_RUNTIME_PM_OPS(imx319_runtime_suspend, imx319_runtime_resume, NULL)
+};
 
 /* Get bayer order based on flip setting. */
 static u32 imx319_get_format_code(struct imx319 *imx319)
@@ -1900,8 +2128,11 @@ static int imx319_set_ctrl(struct v4l2_ctrl *ctrl)
 	 * Applying V4L2 control value only happens
 	 * when power is up for streaming
 	 */
-	if (!pm_runtime_get_if_in_use(imx319->dev))
-		return 0;
+	if (imx319->power_fault)
+		return -EIO;
+	ret = pm_runtime_get_if_in_use(imx319->dev);
+	if (ret <= 0)
+		return ret;
 
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
@@ -1970,7 +2201,7 @@ static int imx319_enum_frame_size(struct v4l2_subdev *sd,
 {
 	struct imx319 *imx319 = to_imx319(sd);
 
-	if (fse->index >= ARRAY_SIZE(supported_modes))
+	if (fse->index >= imx319->profile->num_modes)
 		return -EINVAL;
 
 	mutex_lock(&imx319->mutex);
@@ -1980,9 +2211,9 @@ static int imx319_enum_frame_size(struct v4l2_subdev *sd,
 	}
 	mutex_unlock(&imx319->mutex);
 
-	fse->min_width = supported_modes[fse->index].width;
+	fse->min_width = imx319->profile->modes[fse->index].width;
 	fse->max_width = fse->min_width;
-	fse->min_height = supported_modes[fse->index].height;
+	fse->min_height = imx319->profile->modes[fse->index].height;
 	fse->max_height = fse->min_height;
 
 	return 0;
@@ -2028,6 +2259,48 @@ static int imx319_get_pad_format(struct v4l2_subdev *sd,
 	return ret;
 }
 
+static int imx319_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct imx319 *imx319 = to_imx319(sd);
+	const struct imx319_mode *mode;
+	struct v4l2_mbus_framefmt *format;
+
+	if (sel->pad || (sel->which != V4L2_SUBDEV_FORMAT_ACTIVE &&
+			 sel->which != V4L2_SUBDEV_FORMAT_TRY))
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		sel->r = (struct v4l2_rect) {
+			.left = 0, .top = 0,
+			.width = IMX319_NATIVE_WIDTH,
+			.height = IMX319_NATIVE_HEIGHT,
+		};
+		return 0;
+	case V4L2_SEL_TGT_CROP:
+		mutex_lock(&imx319->mutex);
+		if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
+			format = v4l2_subdev_state_get_format(sd_state, sel->pad);
+			mode = v4l2_find_nearest_size(imx319->profile->modes,
+						      imx319->profile->num_modes,
+						      width, height,
+						      format->width, format->height);
+		} else {
+			mode = imx319->cur_mode;
+		}
+		/* Report the analogue window before binning/digital cropping. */
+		sel->r = mode->analogue_crop;
+		mutex_unlock(&imx319->mutex);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int
 imx319_set_pad_format(struct v4l2_subdev *sd,
 		      struct v4l2_subdev_state *sd_state,
@@ -2043,6 +2316,10 @@ imx319_set_pad_format(struct v4l2_subdev *sd,
 	u32 height;
 
 	mutex_lock(&imx319->mutex);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE && imx319->streaming) {
+		mutex_unlock(&imx319->mutex);
+		return -EBUSY;
+	}
 
 	/*
 	 * Only one bayer order is supported.
@@ -2050,8 +2327,8 @@ imx319_set_pad_format(struct v4l2_subdev *sd,
 	 */
 	fmt->format.code = imx319_get_format_code(imx319);
 
-	mode = v4l2_find_nearest_size(supported_modes,
-				      ARRAY_SIZE(supported_modes),
+	mode = v4l2_find_nearest_size(imx319->profile->modes,
+				      imx319->profile->num_modes,
 				      width, height,
 				      fmt->format.width, fmt->format.height);
 	imx319_update_pad_format(imx319, mode, fmt);
@@ -2060,8 +2337,7 @@ imx319_set_pad_format(struct v4l2_subdev *sd,
 		*framefmt = fmt->format;
 	} else {
 		imx319->cur_mode = mode;
-		pixel_rate = IMX319_LINK_FREQ_DEFAULT * 2 * 4;
-		do_div(pixel_rate, 10);
+		pixel_rate = imx319->profile->pixel_rate;
 		__v4l2_ctrl_s_ctrl_int64(imx319->pixel_rate, pixel_rate);
 		/* Update limits and set FPS to default */
 		height = imx319->cur_mode->height;
@@ -2120,7 +2396,7 @@ static int imx319_start_streaming(struct imx319 *imx319)
 		return ret;
 
 	/* Global Setting */
-	reg_list = &imx319_global_setting;
+	reg_list = imx319->profile->global_setting;
 	ret = imx319_write_regs(imx319, reg_list->regs, reg_list->num_of_regs);
 	if (ret) {
 		dev_err(imx319->dev, "failed to set global settings");
@@ -2159,42 +2435,66 @@ static int imx319_stop_streaming(struct imx319 *imx319)
 static int imx319_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct imx319 *imx319 = to_imx319(sd);
-	int ret = 0;
+	int ret = 0, cleanup_ret;
 
+	enable = !!enable;
 	mutex_lock(&imx319->mutex);
-
+	if (enable && imx319->removing) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (enable == imx319->streaming)
+		goto unlock;
 	if (enable) {
+		if (imx319->power_fault) {
+			ret = -EIO;
+			goto unlock;
+		}
 		ret = pm_runtime_resume_and_get(imx319->dev);
 		if (ret < 0)
-			goto err_unlock;
-
-		/*
-		 * Apply default & customized values
-		 * and then start streaming.
-		 */
+			goto unlock;
 		ret = imx319_start_streaming(imx319);
-		if (ret)
-			goto err_rpm_put;
+		if (ret) {
+			if (!imx319->managed_power) {
+				pm_runtime_put(imx319->dev);
+				goto unlock;
+			}
+			/* Keep the stream's PM reference while attempting standby. */
+			cleanup_ret = imx319->identified ? imx319_stop_streaming(imx319) : 0;
+			if (cleanup_ret)
+				imx319->power_fault = true;
+			cleanup_ret = pm_runtime_put_sync_suspend(imx319->dev);
+			if (cleanup_ret < 0)
+				imx319->power_fault = true;
+			goto unlock;
+		}
+		imx319->streaming = true;
 	} else {
-		imx319_stop_streaming(imx319);
-		pm_runtime_put(imx319->dev);
+		ret = imx319_stop_streaming(imx319);
+		if (ret && imx319->managed_power)
+			imx319->power_fault = true;
+		/* Exactly one reference is owned, even when the stop write fails. */
+		imx319->streaming = false;
+		if (imx319->managed_power)
+			cleanup_ret = pm_runtime_put_sync_suspend(imx319->dev);
+		else {
+			pm_runtime_put(imx319->dev);
+			ret = 0;
+			cleanup_ret = 0;
+		}
+		if (cleanup_ret < 0) {
+			imx319->power_fault = true;
+			if (!ret)
+				ret = cleanup_ret;
+		}
 	}
-
-	/* vflip and hflip cannot change during streaming */
 	__v4l2_ctrl_grab(imx319->vflip, enable);
 	__v4l2_ctrl_grab(imx319->hflip, enable);
-
+unlock:
 	mutex_unlock(&imx319->mutex);
-
-	return ret;
-
-err_rpm_put:
-	pm_runtime_put(imx319->dev);
-err_unlock:
-	mutex_unlock(&imx319->mutex);
-
 	return ret;
 }
+
 
 static const struct v4l2_subdev_core_ops imx319_subdev_core_ops = {
 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
@@ -2209,6 +2509,7 @@ static const struct v4l2_subdev_pad_ops imx319_pad_ops = {
 	.enum_mbus_code = imx319_enum_mbus_code,
 	.get_fmt = imx319_get_pad_format,
 	.set_fmt = imx319_set_pad_format,
+	.get_selection = imx319_get_selection,
 	.enum_frame_size = imx319_enum_frame_size,
 };
 
@@ -2229,6 +2530,7 @@ static const struct v4l2_subdev_internal_ops imx319_internal_ops = {
 /* Initialize control handlers */
 static int imx319_init_controls(struct imx319 *imx319)
 {
+	struct v4l2_fwnode_device_properties props;
 	struct v4l2_ctrl_handler *ctrl_hdlr;
 	s64 exposure_max;
 	s64 vblank_def;
@@ -2239,22 +2541,28 @@ static int imx319_init_controls(struct imx319 *imx319)
 	u32 max;
 	int ret;
 
+	ret = v4l2_fwnode_device_parse(imx319->dev, &props);
+	if (ret)
+		return ret;
+
 	ctrl_hdlr = &imx319->ctrl_handler;
-	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 10);
+	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 12);
 	if (ret)
 		return ret;
 
 	ctrl_hdlr->lock = &imx319->mutex;
-	max = ARRAY_SIZE(link_freq_menu_items) - 1;
+	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &imx319_ctrl_ops, &props);
+	if (ret)
+		goto error;
+	max = imx319->profile->num_link_freqs - 1;
 	imx319->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx319_ctrl_ops,
 						   V4L2_CID_LINK_FREQ, max, 0,
-						   link_freq_menu_items);
+						   imx319->profile->link_freqs);
 	if (imx319->link_freq)
 		imx319->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
-	/* pixel_rate = link_freq * 2 * nr_of_lanes / bits_per_sample */
-	pixel_rate = IMX319_LINK_FREQ_DEFAULT * 2 * 4;
-	do_div(pixel_rate, 10);
+	/* Array timing rate is independent of the CSI transport capacity. */
+	pixel_rate = imx319->profile->pixel_rate;
 	/* By default, PIXEL_RATE is read only */
 	imx319->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx319_ctrl_ops,
 					       V4L2_CID_PIXEL_RATE, pixel_rate,
@@ -2322,9 +2630,12 @@ error:
 	return ret;
 }
 
-static struct imx319_hwcfg *imx319_get_hwcfg(struct device *dev)
+static struct imx319_hwcfg *imx319_get_hwcfg(struct imx319 *imx319)
 {
+	struct device *dev = imx319->dev;
+	const struct imx319_profile *profile;
 	struct imx319_hwcfg *cfg;
+	unsigned int i;
 	struct v4l2_fwnode_endpoint bus_cfg = {
 		.bus_type = V4L2_MBUS_CSI2_DPHY
 	};
@@ -2343,14 +2654,31 @@ static struct imx319_hwcfg *imx319_get_hwcfg(struct device *dev)
 	if (ret)
 		goto out_err;
 
+	if (dev->of_node && bus_cfg.bus.mipi_csi2.num_data_lanes != 4)
+		goto out_err;
+
 	cfg = devm_kzalloc(dev, sizeof(*cfg), GFP_KERNEL);
 	if (!cfg)
 		goto out_err;
 
+	profile = NULL;
+	for (i = 0; i < bus_cfg.nr_of_link_frequencies; i++) {
+		if (bus_cfg.link_frequencies[i] == IMX319_LINK_FREQ_DEFAULT)
+			profile = &imx319_482mhz_profile;
+		else if (bus_cfg.link_frequencies[i] == 222000000)
+			profile = &imx319_222mhz_profile;
+		else
+			continue;
+		break;
+	}
+	if (!profile)
+		goto out_err;
+	imx319->profile = profile;
+
 	ret = v4l2_link_freq_to_bitmap(dev, bus_cfg.link_frequencies,
 				       bus_cfg.nr_of_link_frequencies,
-				       link_freq_menu_items,
-				       ARRAY_SIZE(link_freq_menu_items),
+				       profile->link_freqs,
+				       profile->num_link_freqs,
 				       &cfg->link_freq_bitmap);
 	if (ret)
 		goto out_err;
@@ -2368,117 +2696,124 @@ out_err:
 static int imx319_probe(struct i2c_client *client)
 {
 	struct imx319 *imx319;
+	bool full_power = false, probe_reference = false;
 	unsigned long freq;
-	struct clk *clk;
-	bool full_power;
-	int ret;
+	int ret, cleanup_ret;
 
 	imx319 = devm_kzalloc(&client->dev, sizeof(*imx319), GFP_KERNEL);
 	if (!imx319)
 		return -ENOMEM;
-
 	imx319->dev = &client->dev;
-
 	mutex_init(&imx319->mutex);
-
-	clk = devm_v4l2_sensor_clk_get(imx319->dev, NULL);
-	if (IS_ERR(clk))
-		return dev_err_probe(imx319->dev, PTR_ERR(clk),
-				     "failed to acquire clock\n");
-
-	freq = clk_get_rate(clk);
-	if (freq != IMX319_EXT_CLK)
-		return dev_err_probe(imx319->dev, -EINVAL,
-				     "external clock %lu is not supported",
-				     freq);
-
-	/* Initialize subdev */
-	v4l2_i2c_subdev_init(&imx319->sd, client, &imx319_subdev_ops);
-
-	full_power = acpi_dev_state_d0(imx319->dev);
-	if (full_power) {
-		/* Check module identity */
-		ret = imx319_identify_module(imx319);
-		if (ret) {
-			dev_err(imx319->dev, "failed to find sensor: %d", ret);
-			goto error_probe;
-		}
+	imx319->clk = devm_v4l2_sensor_clk_get(imx319->dev, NULL);
+	if (IS_ERR(imx319->clk)) {
+		ret = PTR_ERR(imx319->clk);
+		goto error_probe;
 	}
-
-	imx319->hwcfg = imx319_get_hwcfg(imx319->dev);
+	freq = clk_get_rate(imx319->clk);
+	if (freq != IMX319_EXT_CLK) {
+		ret = -EINVAL;
+		goto error_probe;
+	}
+	v4l2_i2c_subdev_init(&imx319->sd, client, &imx319_subdev_ops);
+	ret = imx319_get_power_resources(imx319);
+	if (ret)
+		goto error_probe;
+	imx319->hwcfg = imx319_get_hwcfg(imx319);
 	if (!imx319->hwcfg) {
-		dev_err(imx319->dev, "failed to get hwcfg");
 		ret = -ENODEV;
 		goto error_probe;
 	}
-
-	/* Set default mode to max resolution */
-	imx319->cur_mode = &supported_modes[0];
-
+	imx319->cur_mode = &imx319->profile->modes[0];
 	ret = imx319_init_controls(imx319);
-	if (ret) {
-		dev_err(imx319->dev, "failed to init controls: %d", ret);
+	if (ret)
 		goto error_probe;
-	}
-
-	/* Initialize subdev */
 	imx319->sd.internal_ops = &imx319_internal_ops;
-	imx319->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
-		V4L2_SUBDEV_FL_HAS_EVENTS;
+	imx319->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
 	imx319->sd.entity.ops = &imx319_subdev_entity_ops;
 	imx319->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
-
-	/* Initialize source pad */
 	imx319->pad.flags = MEDIA_PAD_FL_SOURCE;
 	ret = media_entity_pads_init(&imx319->sd.entity, 1, &imx319->pad);
-	if (ret) {
-		dev_err(imx319->dev, "failed to init entity pads: %d", ret);
-		goto error_handler_free;
+	if (ret)
+		goto error_handler;
+	if (imx319->managed_power) {
+		ret = imx319_power_on(imx319);
+		if (ret)
+			goto error_entity;
+		full_power = true;
+	} else {
+		full_power = acpi_dev_state_d0(imx319->dev);
 	}
-
-	/* Set the device's state to active if it's in D0 state. */
-	if (full_power)
-		pm_runtime_set_active(imx319->dev);
+	if (full_power) {
+		ret = imx319_identify_module(imx319);
+		if (ret)
+			goto error_power;
+		ret = pm_runtime_set_active(imx319->dev);
+		if (ret)
+			goto error_power;
+	}
+	if (imx319->managed_power) {
+		pm_runtime_get_noresume(imx319->dev);
+		probe_reference = true;
+		pm_runtime_set_autosuspend_delay(imx319->dev, 1000);
+		pm_runtime_use_autosuspend(imx319->dev);
+	}
 	pm_runtime_enable(imx319->dev);
-
 	ret = v4l2_async_register_subdev_sensor(&imx319->sd);
-	if (ret < 0)
-		goto error_media_entity_pm;
-
-	pm_runtime_idle(imx319->dev);
-
+	if (ret)
+		goto error_pm;
+	if (probe_reference) {
+		pm_runtime_mark_last_busy(imx319->dev);
+		pm_runtime_put_autosuspend(imx319->dev);
+	} else {
+		pm_runtime_idle(imx319->dev);
+	}
 	return 0;
-
-error_media_entity_pm:
+error_pm:
 	pm_runtime_disable(imx319->dev);
-	if (full_power)
+	if (imx319->managed_power)
+		pm_runtime_dont_use_autosuspend(imx319->dev);
+	if (probe_reference)
+		pm_runtime_put_noidle(imx319->dev);
+error_power:
+	cleanup_ret = imx319_power_off(imx319);
+	if (cleanup_ret)
+		dev_err(imx319->dev, "probe power rollback incomplete: %d\n", cleanup_ret);
+	else if (full_power)
 		pm_runtime_set_suspended(imx319->dev);
+error_entity:
 	media_entity_cleanup(&imx319->sd.entity);
-
-error_handler_free:
-	v4l2_ctrl_handler_free(imx319->sd.ctrl_handler);
-
+error_handler:
+	v4l2_ctrl_handler_free(&imx319->ctrl_handler);
 error_probe:
 	mutex_destroy(&imx319->mutex);
-
-	return ret;
+	return dev_err_probe(&client->dev, ret, "sensor probe failed\n");
 }
 
 static void imx319_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx319 *imx319 = to_imx319(sd);
+	int ret;
 
 	v4l2_async_unregister_subdev(sd);
+	mutex_lock(&imx319->mutex);
+	imx319->removing = true;
+	mutex_unlock(&imx319->mutex);
+	imx319_set_stream(sd, 0);
+	pm_runtime_disable(imx319->dev);
+	if (imx319->managed_power)
+		pm_runtime_dont_use_autosuspend(imx319->dev);
+	ret = imx319_power_off(imx319);
+	if (ret)
+		dev_err(imx319->dev, "remove power rollback incomplete: %d\n", ret);
+	else if (!pm_runtime_status_suspended(imx319->dev))
+		pm_runtime_set_suspended(imx319->dev);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(sd->ctrl_handler);
-
-	pm_runtime_disable(imx319->dev);
-	if (!pm_runtime_status_suspended(imx319->dev))
-		pm_runtime_set_suspended(imx319->dev);
-
 	mutex_destroy(&imx319->mutex);
 }
+
 
 static const struct acpi_device_id imx319_acpi_ids[] __maybe_unused = {
 	{ "SONY319A" },
@@ -2486,10 +2821,18 @@ static const struct acpi_device_id imx319_acpi_ids[] __maybe_unused = {
 };
 MODULE_DEVICE_TABLE(acpi, imx319_acpi_ids);
 
+static const struct of_device_id imx319_of_match[] = {
+	{ .compatible = "sony,imx319" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, imx319_of_match);
+
 static struct i2c_driver imx319_i2c_driver = {
 	.driver = {
 		.name = "imx319",
 		.acpi_match_table = ACPI_PTR(imx319_acpi_ids),
+		.of_match_table = imx319_of_match,
+		.pm = pm_ptr(&imx319_pm_ops),
 	},
 	.probe = imx319_probe,
 	.remove = imx319_remove,

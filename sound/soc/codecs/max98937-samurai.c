@@ -30,7 +30,6 @@ struct max37 {
 	struct mutex lock;
 	bool powered, muted, failed;
 	u32 channel;
-	unsigned int starts, stops;
 };
 
 /* The preparation script fills this table from the pinned GPL source and
@@ -205,14 +204,11 @@ static int max37_event(struct snd_soc_dapm_widget *w,
 			amp->powered = true;
 			ret = max37_reconcile(amp);
 		}
-		if (!ret)
-			amp->starts++;
 	} else {
 		amp->powered = false;
 		ret = max37_reconcile(amp);
 		if (!ret)
 			ret = regmap_update_bits(amp->map, MAX37_AMP, 1, 0);
-		amp->stops++;
 	}
 	ret = max37_fault(amp, ret);
 	mutex_unlock(&amp->lock);
@@ -259,34 +255,6 @@ static void max37_reset(void *data)
 	amp->muted = true;
 	mutex_unlock(&amp->lock);
 }
-
-static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct max37 *amp = dev_get_drvdata(dev);
-	unsigned int id, global, enable, raw1, raw2, raw3;
-	int ret;
-	mutex_lock(&amp->lock);
-	if (amp->failed) {
-		ret = -EIO;
-		goto out;
-	}
-	ret = regmap_read(amp->map, MAX37_REV, &id);
-	if (!ret) ret = regmap_read(amp->map, MAX37_GLOBAL, &global);
-	if (!ret) ret = regmap_read(amp->map, MAX37_AMP, &enable);
-	if (!ret) ret = regmap_read(amp->map, 1, &raw1);
-	if (!ret) ret = regmap_read(amp->map, 2, &raw2);
-	if (!ret) ret = regmap_read(amp->map, 3, &raw3);
-	if (!ret)
-		ret = sysfs_emit(buf, "id=%02x channel=%u global=%02x amp=%02x raw=%02x,%02x,%02x powered=%u muted=%u starts=%u stops=%u failed=%u\n",
-			id, amp->channel, global, enable, raw1, raw2, raw3,
-			amp->powered, amp->muted, amp->starts, amp->stops, amp->failed);
-out:
-	mutex_unlock(&amp->lock);
-	return ret;
-}
-static DEVICE_ATTR_RO(status);
-static struct attribute *max37_attrs[] = { &dev_attr_status.attr, NULL };
-ATTRIBUTE_GROUPS(max37);
 
 static int max37_probe(struct i2c_client *client)
 {
@@ -360,8 +328,7 @@ static const struct of_device_id max37_of[] = {
 };
 MODULE_DEVICE_TABLE(of, max37_of);
 static struct i2c_driver max37_driver = {
-	.driver = { .name = "max98937-samurai", .of_match_table = max37_of,
-		    .dev_groups = max37_groups },
+	.driver = { .name = "max98937-samurai", .of_match_table = max37_of },
 	.probe = max37_probe, .shutdown = max37_shutdown,
 };
 module_i2c_driver(max37_driver);

@@ -65,6 +65,7 @@
 		vddd-supply = <&cam_main_vdig>;
 		vddio-supply = <&vreg_l1c_1p8>;
 		lens-focus = <&cam_main_lens>;
+		flash-leds = <&flash_led>;
 		clocks = <&camcc CAM_CC_MCLK0_CLK>;
 		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
 		assigned-clock-rates = <19200000>;

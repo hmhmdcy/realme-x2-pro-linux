@@ -42,7 +42,7 @@
 &cci1_i2c0 {
 	status = "okay";
 	cam_tele: camera@2d {
-		compatible = "samsung,s5k3m5";
+		compatible = "realme,rmx1931-s5k3m5", "samsung,s5k3m5";
 		reg = <0x2d>;
 		orientation = <1>;
 		power-domains = <&camcc TITAN_TOP_GDSC>;

@@ -6,6 +6,11 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/property.h>
+#include <linux/string.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/units.h>
@@ -97,8 +102,24 @@ static const char * const s5k3m5_supply_names[] = {
 
 #define S5K3M5_NUM_SUPPLIES	ARRAY_SIZE(s5k3m5_supply_names)
 
+struct s5k3m5_profile {
+	const struct s5k3m5_mode *modes;
+	unsigned int num_modes;
+	const s64 *link_freqs;
+	unsigned int num_link_freqs;
+	u64 pixel_rate;
+	unsigned long mclk_rate;
+	bool rmx1931;
+};
+
 struct s5k3m5 {
 	struct device *dev;
+	const struct s5k3m5_profile *profile;
+	bool supply_enabled[S5K3M5_NUM_SUPPLIES];
+	bool clock_enabled;
+	bool power_fault;
+	bool streaming;
+	bool removing;
 	struct regmap *regmap;
 	struct clk *mclk;
 	struct gpio_desc *reset_gpio;
@@ -715,6 +736,25 @@ static const struct s5k3m5_mode s5k3m5_supported_modes[] = {
 	},
 };
 
+#include "s5k3m5-oem-tables.h"
+
+static const struct s5k3m5_mode s5k3m5_rmx_modes[] = {
+	{ .width = 2104, .height = 1560, .hts = 9648, .vts = 1663, .exposure = 256,
+	  .reg_list = { s5k3m5_rmx_mode3_regs, ARRAY_SIZE(s5k3m5_rmx_mode3_regs) } },
+};
+static const s64 s5k3m5_rmx_link_freqs[] = { 723200000 };
+static const struct s5k3m5_profile s5k3m5_default_profile = {
+	.modes = s5k3m5_supported_modes, .num_modes = ARRAY_SIZE(s5k3m5_supported_modes),
+	.link_freqs = s5k3m5_link_freq_menu, .num_link_freqs = ARRAY_SIZE(s5k3m5_link_freq_menu),
+	.pixel_rate = 482000000, .mclk_rate = S5K3M5_MCLK_FREQ_24MHZ,
+};
+static const struct s5k3m5_profile s5k3m5_rmx_profile = {
+	.modes = s5k3m5_rmx_modes, .num_modes = ARRAY_SIZE(s5k3m5_rmx_modes),
+	.link_freqs = s5k3m5_rmx_link_freqs, .num_link_freqs = ARRAY_SIZE(s5k3m5_rmx_link_freqs),
+	/* OEM mode3 timing metadata; native SOF/line timing validation pending. */
+	.pixel_rate = 481930000, .mclk_rate = 19200000, .rmx1931 = true,
+};
+
 static int s5k3m5_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct s5k3m5 *s5k3m5 = container_of(ctrl->handler, struct s5k3m5,
@@ -741,8 +781,11 @@ static int s5k3m5_set_ctrl(struct v4l2_ctrl *ctrl)
 	}
 
 	/* V4L2 controls are applied, when sensor is powered up for streaming */
-	if (!pm_runtime_get_if_active(s5k3m5->dev))
-		return 0;
+	if (s5k3m5->profile->rmx1931 && (s5k3m5->removing || s5k3m5->power_fault))
+		return -EIO;
+	ret = pm_runtime_get_if_active(s5k3m5->dev);
+	if (ret <= 0)
+		return ret;
 
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
@@ -775,11 +818,6 @@ static const struct v4l2_ctrl_ops s5k3m5_ctrl_ops = {
 	.s_ctrl = s5k3m5_set_ctrl,
 };
 
-static inline u64 s5k3m5_freq_to_pixel_rate(const u64 freq)
-{
-	return div_u64(freq * 2 * S5K3M5_DATA_LANES, 10);
-}
-
 static int s5k3m5_init_controls(struct s5k3m5 *s5k3m5)
 {
 	struct v4l2_ctrl_handler *ctrl_hdlr = &s5k3m5->ctrl_handler;
@@ -792,12 +830,12 @@ static int s5k3m5_init_controls(struct s5k3m5 *s5k3m5)
 
 	s5k3m5->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, &s5k3m5_ctrl_ops,
 					V4L2_CID_LINK_FREQ,
-					ARRAY_SIZE(s5k3m5_link_freq_menu) - 1,
-					0, s5k3m5_link_freq_menu);
+					s5k3m5->profile->num_link_freqs - 1,
+					0, s5k3m5->profile->link_freqs);
 	if (s5k3m5->link_freq)
 		s5k3m5->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
-	pixel_rate = s5k3m5_freq_to_pixel_rate(s5k3m5_link_freq_menu[0]);
+	pixel_rate = s5k3m5->profile->pixel_rate;
 	s5k3m5->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &s5k3m5_ctrl_ops,
 					       V4L2_CID_PIXEL_RATE,
 					       0, pixel_rate, 1, pixel_rate);
@@ -822,7 +860,7 @@ static int s5k3m5_init_controls(struct s5k3m5 *s5k3m5)
 	exposure_max = mode->vts - S5K3M5_EXPOSURE_MARGIN;
 	s5k3m5->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &s5k3m5_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
-					     S5K3M5_EXPOSURE_MIN,
+					     s5k3m5->profile->rmx1931 ? 1 : S5K3M5_EXPOSURE_MIN,
 					     exposure_max,
 					     S5K3M5_EXPOSURE_STEP,
 					     mode->exposure);
@@ -842,6 +880,10 @@ static int s5k3m5_init_controls(struct s5k3m5 *s5k3m5)
 	if (s5k3m5->vflip)
 		s5k3m5->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
 
+	if (ctrl_hdlr->error) {
+		ret = ctrl_hdlr->error;
+		goto error_free_hdlr;
+	}
 	ret = v4l2_fwnode_device_parse(s5k3m5->dev, &props);
 	if (ret)
 		goto error_free_hdlr;
@@ -861,6 +903,18 @@ error_free_hdlr:
 	return ret;
 }
 
+static int s5k3m5_stop_hw(struct s5k3m5 *sensor)
+{
+	int ret;
+
+	if (!sensor->profile->rmx1931)
+		return cci_write(sensor->regmap, S5K3M5_REG_CTRL_MODE, 0, NULL);
+	ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 0, NULL);
+	/* Actual OEM streamOffSettings: delayUs=30000 before power/lease release. */
+	usleep_range(30000, 31000);
+	return ret;
+}
+
 static int s5k3m5_enable_streams(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *state, u32 pad,
 				 u64 streams_mask)
@@ -869,10 +923,33 @@ static int s5k3m5_enable_streams(struct v4l2_subdev *sd,
 	const struct s5k3m5_reg_list *reg_list = &s5k3m5->mode->reg_list;
 	int ret;
 
+	if (s5k3m5->removing)
+		return -ENODEV;
+	if (s5k3m5->streaming)
+		return 0;
+	if (s5k3m5->power_fault)
+		return -EIO;
 	ret = pm_runtime_resume_and_get(s5k3m5->dev);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
+	if (s5k3m5->profile->rmx1931) {
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(s5k3m5_rmx_init); i++) {
+			const struct s5k3m5_oem_reg *reg = &s5k3m5_rmx_init[i];
+
+			ret = cci_write(s5k3m5->regmap, reg->reg, reg->value, NULL);
+			if (ret)
+				goto error;
+			if (reg->delay_us)
+				usleep_range(reg->delay_us, reg->delay_us + 5);
+		}
+		cci_multi_reg_write(s5k3m5->regmap, reg_list->regs, reg_list->num_regs, &ret);
+		if (ret)
+			goto error;
+		goto setup_controls;
+	}
 	/* Page pointer */
 	cci_write(s5k3m5->regmap, CCI_REG16(0x6028), 0x4000, &ret);
 
@@ -900,20 +977,42 @@ static int s5k3m5_enable_streams(struct v4l2_subdev *sd,
 	if (ret)
 		goto error;
 
+setup_controls:
 	ret = __v4l2_ctrl_handler_setup(s5k3m5->sd.ctrl_handler);
 
-	cci_write(s5k3m5->regmap, S5K3M5_REG_CTRL_MODE,
-		  S5K3M5_MODE_STREAMING |
-		  (s5k3m5->vflip->val ? S5K3M5_VFLIP : 0) |
-		  (s5k3m5->hflip->val ? S5K3M5_HFLIP : 0), &ret);
+	if (s5k3m5->profile->rmx1931) {
+		cci_write(s5k3m5->regmap, CCI_REG8(0x0101),
+			  (s5k3m5->vflip->val ? S5K3M5_VFLIP : 0) |
+			  (s5k3m5->hflip->val ? S5K3M5_HFLIP : 0), &ret);
+		cci_write(s5k3m5->regmap, CCI_REG8(0x0100), 1, &ret);
+	} else {
+		cci_write(s5k3m5->regmap, S5K3M5_REG_CTRL_MODE,
+			  S5K3M5_MODE_STREAMING |
+			  (s5k3m5->vflip->val ? S5K3M5_VFLIP : 0) |
+			  (s5k3m5->hflip->val ? S5K3M5_HFLIP : 0), &ret);
+	}
 	if (ret)
 		goto error;
 
+	s5k3m5->streaming = true;
+	__v4l2_ctrl_grab(s5k3m5->hflip, true);
+	__v4l2_ctrl_grab(s5k3m5->vflip, true);
 	return 0;
 
 error:
 	dev_err(s5k3m5->dev, "failed to start streaming: %d\n", ret);
-	pm_runtime_put_autosuspend(s5k3m5->dev);
+	if (s5k3m5->profile->rmx1931) {
+		int cleanup_ret;
+
+		cleanup_ret = s5k3m5_stop_hw(s5k3m5);
+		if (cleanup_ret)
+			s5k3m5->power_fault = true;
+		cleanup_ret = pm_runtime_put_sync_suspend(s5k3m5->dev);
+		if (cleanup_ret < 0)
+			s5k3m5->power_fault = true;
+	} else {
+		pm_runtime_put_autosuspend(s5k3m5->dev);
+	}
 
 	return ret;
 }
@@ -925,11 +1024,28 @@ static int s5k3m5_disable_streams(struct v4l2_subdev *sd,
 	struct s5k3m5 *s5k3m5 = to_s5k3m5(sd);
 	int ret;
 
-	ret = cci_write(s5k3m5->regmap, S5K3M5_REG_CTRL_MODE, 0, NULL);
-	if (ret)
+	if (!s5k3m5->streaming)
+		return 0;
+	ret = s5k3m5_stop_hw(s5k3m5);
+	if (ret) {
 		dev_err(s5k3m5->dev, "failed to stop streaming: %d\n", ret);
+		if (s5k3m5->profile->rmx1931)
+			s5k3m5->power_fault = true;
+	}
+	s5k3m5->streaming = false;
+	if (s5k3m5->profile->rmx1931) {
+		int suspend_ret = pm_runtime_put_sync_suspend(s5k3m5->dev);
 
-	pm_runtime_put_autosuspend(s5k3m5->dev);
+		if (suspend_ret < 0) {
+			s5k3m5->power_fault = true;
+			if (!ret)
+				ret = suspend_ret;
+		}
+	} else {
+		pm_runtime_put_autosuspend(s5k3m5->dev);
+	}
+	__v4l2_ctrl_grab(s5k3m5->hflip, false);
+	__v4l2_ctrl_grab(s5k3m5->vflip, false);
 
 	return ret;
 }
@@ -965,8 +1081,10 @@ static int s5k3m5_set_pad_format(struct v4l2_subdev *sd,
 	s64 hblank, vblank, exposure_max;
 	const struct s5k3m5_mode *mode;
 
-	mode = v4l2_find_nearest_size(s5k3m5_supported_modes,
-				      ARRAY_SIZE(s5k3m5_supported_modes),
+	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE && s5k3m5->streaming)
+		return -EBUSY;
+	mode = v4l2_find_nearest_size(s5k3m5->profile->modes,
+				      s5k3m5->profile->num_modes,
 				      width, height,
 				      fmt->format.width, fmt->format.height);
 
@@ -986,7 +1104,7 @@ static int s5k3m5_set_pad_format(struct v4l2_subdev *sd,
 	__v4l2_ctrl_s_ctrl(s5k3m5->vblank, vblank);
 
 	exposure_max = mode->vts - S5K3M5_EXPOSURE_MARGIN;
-	__v4l2_ctrl_modify_range(s5k3m5->exposure, S5K3M5_EXPOSURE_MIN,
+	__v4l2_ctrl_modify_range(s5k3m5->exposure, s5k3m5->profile->rmx1931 ? 1 : S5K3M5_EXPOSURE_MIN,
 				 exposure_max, S5K3M5_EXPOSURE_STEP,
 				 mode->exposure);
 	__v4l2_ctrl_s_ctrl(s5k3m5->exposure, mode->exposure);
@@ -1023,15 +1141,15 @@ static int s5k3m5_enum_frame_size(struct v4l2_subdev *sd,
 {
 	struct s5k3m5 *s5k3m5 = to_s5k3m5(sd);
 
-	if (fse->index >= ARRAY_SIZE(s5k3m5_supported_modes))
+	if (fse->index >= s5k3m5->profile->num_modes)
 		return -EINVAL;
 
 	if (fse->code != s5k3m5_get_format_code(s5k3m5))
 		return -EINVAL;
 
-	fse->min_width = s5k3m5_supported_modes[fse->index].width;
+	fse->min_width = s5k3m5->profile->modes[fse->index].width;
 	fse->max_width = fse->min_width;
-	fse->min_height = s5k3m5_supported_modes[fse->index].height;
+	fse->min_height = s5k3m5->profile->modes[fse->index].height;
 	fse->max_height = fse->min_height;
 
 	return 0;
@@ -1042,17 +1160,31 @@ static int s5k3m5_get_selection(struct v4l2_subdev *sd,
 				struct v4l2_subdev_selection *sel)
 {
 	struct s5k3m5 *s5k3m5 = to_s5k3m5(sd);
+	const struct s5k3m5_mode *mode = s5k3m5->mode;
+	struct v4l2_mbus_framefmt *fmt;
 
-	if (sel->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+	if (sel->pad || sel->stream ||
+	    (sel->which != V4L2_SUBDEV_FORMAT_ACTIVE &&
+	     sel->which != V4L2_SUBDEV_FORMAT_TRY))
 		return -EINVAL;
 
 	switch (sel->target) {
 	case V4L2_SEL_TGT_CROP:
 	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
+			fmt = v4l2_subdev_state_get_format(sd_state, 0);
+			if (!fmt)
+				return -EINVAL;
+			mode = v4l2_find_nearest_size(s5k3m5->profile->modes,
+						      s5k3m5->profile->num_modes,
+						      width, height,
+						      fmt->width, fmt->height);
+		}
 		sel->r.left = 0;
 		sel->r.top = 0;
-		sel->r.width = s5k3m5->mode->width;
-		sel->r.height = s5k3m5->mode->width;
+		sel->r.width = mode->width;
+		sel->r.height = mode->height;
 		return 0;
 	default:
 		return -EINVAL;
@@ -1162,8 +1294,8 @@ static int s5k3m5_check_hwcfg(struct s5k3m5 *s5k3m5)
 
 	ret = v4l2_link_freq_to_bitmap(s5k3m5->dev, bus_cfg.link_frequencies,
 				       bus_cfg.nr_of_link_frequencies,
-				       s5k3m5_link_freq_menu,
-				       ARRAY_SIZE(s5k3m5_link_freq_menu),
+				       s5k3m5->profile->link_freqs,
+				       s5k3m5->profile->num_link_freqs,
 				       &freq_bitmap);
 
 endpoint_free:
@@ -1172,12 +1304,135 @@ endpoint_free:
 	return ret;
 }
 
+static int s5k3m5_rmx_resources(struct s5k3m5 *sensor)
+{
+	struct device *dev = sensor->dev;
+	unsigned int i;
+	int ret;
+
+	sensor->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(sensor->reset_gpio))
+		return PTR_ERR(sensor->reset_gpio);
+	/* Index0 is deliberately unused: AF has its own independent consumer. */
+	for (i = 1; i < S5K3M5_NUM_SUPPLIES; i++) {
+		sensor->supplies[i].supply = s5k3m5_supply_names[i];
+		sensor->supplies[i].consumer = devm_regulator_get(dev, s5k3m5_supply_names[i]);
+		if (IS_ERR(sensor->supplies[i].consumer))
+			return PTR_ERR(sensor->supplies[i].consumer);
+	}
+	ret = regulator_set_voltage(sensor->supplies[1].consumer, 2800000, 2800000);
+	if (ret)
+		return ret;
+	ret = regulator_set_voltage(sensor->supplies[2].consumer, 1056000, 1056000);
+	if (ret)
+		return ret;
+	ret = regulator_get_voltage(sensor->supplies[3].consumer);
+	return ret == 1800000 ? 0 : ret < 0 ? ret : -EINVAL;
+}
+
+static int s5k3m5_rmx_power_off(struct s5k3m5 *sensor)
+{
+	/* OEM order: MCLK, RESET low, VIO, VANA, VDIG. */
+	static const unsigned int order[] = { 3, 1, 2 };
+	unsigned int i, index;
+	int ret, first = 0;
+
+	if (sensor->clock_enabled) {
+		clk_disable_unprepare(sensor->mclk);
+		sensor->clock_enabled = false;
+	}
+	usleep_range(1000, 1100);
+	ret = gpiod_set_value_cansleep(sensor->reset_gpio, 1);
+	if (ret)
+		first = ret;
+	usleep_range(1000, 1100);
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		index = order[i];
+		if (!sensor->supply_enabled[index])
+			continue;
+		ret = regulator_disable(sensor->supplies[index].consumer);
+		if (!ret)
+			sensor->supply_enabled[index] = false;
+		else if (!first)
+			first = ret;
+	}
+	ret = pinctrl_pm_select_sleep_state(sensor->dev);
+	if (ret && !first)
+		first = ret;
+	if (first)
+		sensor->power_fault = true;
+	return first;
+}
+
+static int s5k3m5_rmx_power_on(struct s5k3m5 *sensor)
+{
+	static const unsigned int order[] = { 3, 1, 2 };
+	unsigned int i, index;
+	int ret, cleanup_ret;
+	bool lease_busy;
+
+	if (sensor->power_fault || sensor->clock_enabled || sensor->supply_enabled[1] ||
+	    sensor->supply_enabled[2] || sensor->supply_enabled[3])
+		return -EIO;
+	ret = pinctrl_pm_select_default_state(sensor->dev);
+	if (ret)
+		goto failed;
+	ret = gpiod_set_value_cansleep(sensor->reset_gpio, 1);
+	if (ret)
+		goto failed;
+	usleep_range(1000, 1100);
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		index = order[i];
+		ret = regulator_enable(sensor->supplies[index].consumer);
+		if (ret)
+			goto failed;
+		sensor->supply_enabled[index] = true;
+		usleep_range(1000, 1100);
+	}
+	/* OEM custom1/custom2 have no valid GPIO; keep their two 1ms waits. */
+	usleep_range(2000, 2200);
+	ret = gpiod_set_value_cansleep(sensor->reset_gpio, 0);
+	if (ret)
+		goto failed;
+	usleep_range(5000, 5500);
+	ret = clk_prepare_enable(sensor->mclk);
+	if (ret)
+		goto failed;
+	sensor->clock_enabled = true;
+	usleep_range(1000, 1100);
+	return 0;
+failed:
+	/* A first-P-output lease conflict is retryable after our own rollback. */
+	lease_busy = ret == -EBUSY && !sensor->supply_enabled[1] && !sensor->supply_enabled[2];
+	if (!lease_busy)
+		sensor->power_fault = true;
+	cleanup_ret = s5k3m5_rmx_power_off(sensor);
+	if (cleanup_ret)
+		dev_err(sensor->dev, "power rollback incomplete: %d\n", cleanup_ret);
+	return ret;
+}
+
+static void s5k3m5_rmx_cleanup(void *data)
+{
+	struct s5k3m5 *sensor = data;
+	int ret;
+
+	if (!sensor->clock_enabled && !sensor->supply_enabled[1] &&
+	    !sensor->supply_enabled[2] && !sensor->supply_enabled[3])
+		return;
+	ret = s5k3m5_rmx_power_off(sensor);
+	if (ret)
+		dev_err(sensor->dev, "managed cleanup incomplete, P fault remains latched: %d\n", ret);
+}
+
 static int s5k3m5_power_on(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct s5k3m5 *s5k3m5 = to_s5k3m5(sd);
 	int ret;
 
+	if (s5k3m5->profile->rmx1931)
+		return s5k3m5_rmx_power_on(s5k3m5);
 	ret = regulator_bulk_enable(S5K3M5_NUM_SUPPLIES, s5k3m5->supplies);
 	if (ret)
 		return ret;
@@ -1202,6 +1457,8 @@ static int s5k3m5_power_off(struct device *dev)
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct s5k3m5 *s5k3m5 = to_s5k3m5(sd);
 
+	if (s5k3m5->profile->rmx1931)
+		return s5k3m5_rmx_power_off(s5k3m5);
 	gpiod_set_value_cansleep(s5k3m5->reset_gpio, 1);
 
 	clk_disable_unprepare(s5k3m5->mclk);
@@ -1223,6 +1480,12 @@ static int s5k3m5_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	s5k3m5->dev = &client->dev;
+	s5k3m5->profile = device_get_match_data(&client->dev);
+	if (!s5k3m5->profile)
+		s5k3m5->profile = &s5k3m5_default_profile;
+	if (of_machine_is_compatible("realme,samurai") &&
+	    s5k3m5->profile == &s5k3m5_default_profile)
+		s5k3m5->profile = &s5k3m5_rmx_profile;
 	v4l2_i2c_subdev_init(&s5k3m5->sd, client, &s5k3m5_subdev_ops);
 
 	s5k3m5->regmap = devm_cci_regmap_init_i2c(client, 16);
@@ -1236,7 +1499,7 @@ static int s5k3m5_probe(struct i2c_client *client)
 				     "failed to get MCLK clock\n");
 
 	freq = clk_get_rate(s5k3m5->mclk);
-	if (freq != S5K3M5_MCLK_FREQ_24MHZ)
+	if (freq != s5k3m5->profile->mclk_rate)
 		return dev_err_probe(s5k3m5->dev, -EINVAL,
 				     "MCLK clock frequency %lu is not supported\n",
 				     freq);
@@ -1246,20 +1509,29 @@ static int s5k3m5_probe(struct i2c_client *client)
 		return dev_err_probe(s5k3m5->dev, ret,
 				     "failed to check HW configuration\n");
 
-	s5k3m5->reset_gpio = devm_gpiod_get_optional(s5k3m5->dev, "reset",
-						     GPIOD_OUT_HIGH);
-	if (IS_ERR(s5k3m5->reset_gpio))
-		return dev_err_probe(s5k3m5->dev, PTR_ERR(s5k3m5->reset_gpio),
-				     "cannot get reset GPIO\n");
+	if (s5k3m5->profile->rmx1931) {
+		ret = s5k3m5_rmx_resources(s5k3m5);
+		if (ret)
+			return dev_err_probe(s5k3m5->dev, ret, "RMX1931 power resources unavailable\n");
+		ret = devm_add_action_or_reset(s5k3m5->dev, s5k3m5_rmx_cleanup, s5k3m5);
+		if (ret)
+			return ret;
+	} else {
+		s5k3m5->reset_gpio = devm_gpiod_get_optional(s5k3m5->dev, "reset",
+							     GPIOD_OUT_HIGH);
+		if (IS_ERR(s5k3m5->reset_gpio))
+			return dev_err_probe(s5k3m5->dev, PTR_ERR(s5k3m5->reset_gpio),
+					     "cannot get reset GPIO\n");
 
-	for (i = 0; i < S5K3M5_NUM_SUPPLIES; i++)
-		s5k3m5->supplies[i].supply = s5k3m5_supply_names[i];
+		for (i = 0; i < S5K3M5_NUM_SUPPLIES; i++)
+			s5k3m5->supplies[i].supply = s5k3m5_supply_names[i];
 
-	ret = devm_regulator_bulk_get(s5k3m5->dev, S5K3M5_NUM_SUPPLIES,
-				      s5k3m5->supplies);
-	if (ret)
-		return dev_err_probe(s5k3m5->dev, ret,
-				     "failed to get supply regulators\n");
+		ret = devm_regulator_bulk_get(s5k3m5->dev, S5K3M5_NUM_SUPPLIES,
+					      s5k3m5->supplies);
+		if (ret)
+			return dev_err_probe(s5k3m5->dev, ret,
+					     "failed to get supply regulators\n");
+	}
 
 	/* The sensor must be powered on to read the CHIP_ID register */
 	ret = s5k3m5_power_on(s5k3m5->dev);
@@ -1272,7 +1544,7 @@ static int s5k3m5_probe(struct i2c_client *client)
 		goto power_off;
 	}
 
-	s5k3m5->mode = &s5k3m5_supported_modes[0];
+	s5k3m5->mode = &s5k3m5->profile->modes[0];
 	ret = s5k3m5_init_controls(s5k3m5);
 	if (ret) {
 		dev_err_probe(s5k3m5->dev, ret, "failed to init controls\n");
@@ -1300,7 +1572,12 @@ static int s5k3m5_probe(struct i2c_client *client)
 		goto media_entity_cleanup;
 	}
 
-	pm_runtime_set_active(s5k3m5->dev);
+	ret = pm_runtime_set_active(s5k3m5->dev);
+	if (ret)
+		goto subdev_cleanup_without_pm;
+	pm_runtime_get_noresume(s5k3m5->dev);
+	pm_runtime_set_autosuspend_delay(s5k3m5->dev, 1000);
+	pm_runtime_use_autosuspend(s5k3m5->dev);
 	pm_runtime_enable(s5k3m5->dev);
 
 	ret = v4l2_async_register_subdev_sensor(&s5k3m5->sd);
@@ -1310,16 +1587,16 @@ static int s5k3m5_probe(struct i2c_client *client)
 		goto subdev_cleanup;
 	}
 
-	pm_runtime_set_autosuspend_delay(s5k3m5->dev, 1000);
-	pm_runtime_use_autosuspend(s5k3m5->dev);
-	pm_runtime_idle(s5k3m5->dev);
+	pm_runtime_mark_last_busy(s5k3m5->dev);
+	pm_runtime_put_autosuspend(s5k3m5->dev);
 
 	return 0;
 
 subdev_cleanup:
-	v4l2_subdev_cleanup(&s5k3m5->sd);
+	pm_runtime_put_noidle(s5k3m5->dev);
 	pm_runtime_disable(s5k3m5->dev);
-	pm_runtime_set_suspended(s5k3m5->dev);
+subdev_cleanup_without_pm:
+	v4l2_subdev_cleanup(&s5k3m5->sd);
 
 media_entity_cleanup:
 	media_entity_cleanup(&s5k3m5->sd.entity);
@@ -1328,7 +1605,14 @@ v4l2_ctrl_handler_free:
 	v4l2_ctrl_handler_free(s5k3m5->sd.ctrl_handler);
 
 power_off:
-	s5k3m5_power_off(s5k3m5->dev);
+	{
+		int cleanup_ret = s5k3m5_power_off(s5k3m5->dev);
+
+		if (cleanup_ret)
+			dev_err(s5k3m5->dev, "probe power cleanup incomplete: %d\n", cleanup_ret);
+		else
+			pm_runtime_set_suspended(s5k3m5->dev);
+	}
 
 	return ret;
 }
@@ -1338,15 +1622,26 @@ static void s5k3m5_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct s5k3m5 *s5k3m5 = to_s5k3m5(sd);
 
+	struct v4l2_subdev_state *state;
+
 	v4l2_async_unregister_subdev(sd);
+	state = v4l2_subdev_lock_and_get_active_state(sd);
+	s5k3m5->removing = true;
+	if (s5k3m5->streaming)
+		s5k3m5_disable_streams(sd, state, 0, BIT_ULL(0));
+	v4l2_subdev_unlock_state(state);
 	v4l2_subdev_cleanup(sd);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(sd->ctrl_handler);
 	pm_runtime_disable(s5k3m5->dev);
 
-	if (!pm_runtime_status_suspended(s5k3m5->dev)) {
-		s5k3m5_power_off(s5k3m5->dev);
-		pm_runtime_set_suspended(s5k3m5->dev);
+	if (s5k3m5->profile->rmx1931 || !pm_runtime_status_suspended(s5k3m5->dev)) {
+		int ret = s5k3m5_power_off(s5k3m5->dev);
+
+		if (ret)
+			dev_err(s5k3m5->dev, "remove power cleanup incomplete: %d\n", ret);
+		else
+			pm_runtime_set_suspended(s5k3m5->dev);
 	}
 }
 
@@ -1355,7 +1650,8 @@ static const struct dev_pm_ops s5k3m5_pm_ops = {
 };
 
 static const struct of_device_id s5k3m5_of_match[] = {
-	{ .compatible = "samsung,s5k3m5" },
+	{ .compatible = "realme,rmx1931-s5k3m5", .data = &s5k3m5_rmx_profile },
+	{ .compatible = "samsung,s5k3m5", .data = &s5k3m5_default_profile },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, s5k3m5_of_match);

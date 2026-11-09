@@ -11,6 +11,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/regulator/consumer.h>
 
 #define CCI_HW_VERSION				0x0
 #define CCI_RESET_CMD				0x004
@@ -127,6 +128,9 @@ struct cci {
 	const struct cci_data *data;
 	struct clk_bulk_data *clocks;
 	int nclocks;
+	struct regulator *vddio;
+	bool io_enabled;
+	bool clocks_enabled;
 	struct cci_master master[NUM_MASTERS];
 };
 
@@ -463,18 +467,68 @@ static const struct i2c_algorithm cci_algo = {
 
 static int cci_enable_clocks(struct cci *cci)
 {
-	return clk_bulk_prepare_enable(cci->nclocks, cci->clocks);
+	int ret;
+
+	if (cci->clocks_enabled)
+		return 0;
+	ret = clk_bulk_prepare_enable(cci->nclocks, cci->clocks);
+	if (!ret)
+		cci->clocks_enabled = true;
+	return ret;
 }
 
 static void cci_disable_clocks(struct cci *cci)
 {
+	if (!cci->clocks_enabled)
+		return;
 	clk_bulk_disable_unprepare(cci->nclocks, cci->clocks);
+	cci->clocks_enabled = false;
+}
+
+static int cci_enable_io(struct cci *cci)
+{
+	int ret;
+
+	if (!cci->vddio || cci->io_enabled)
+		return 0;
+	ret = regulator_enable(cci->vddio);
+	if (!ret)
+		cci->io_enabled = true;
+	return ret;
+}
+
+static int cci_disable_io(struct cci *cci)
+{
+	int ret;
+
+	if (!cci->io_enabled)
+		return 0;
+	ret = regulator_disable(cci->vddio);
+	if (!ret)
+		cci->io_enabled = false;
+	return ret;
+}
+
+static void cci_release_power(void *data)
+{
+	struct cci *cci = data;
+	int ret;
+
+	ret = cci_disable_io(cci);
+	if (ret)
+		dev_err(cci->dev, "failed to release I/O supply: %d\n", ret);
+	cci_disable_clocks(cci);
 }
 
 static int __maybe_unused cci_suspend_runtime(struct device *dev)
 {
 	struct cci *cci = dev_get_drvdata(dev);
+	int ret;
 
+	/* Keep the active clock state if the supply cannot be released. */
+	ret = cci_disable_io(cci);
+	if (ret)
+		return ret;
 	cci_disable_clocks(cci);
 	return 0;
 }
@@ -484,9 +538,18 @@ static int __maybe_unused cci_resume_runtime(struct device *dev)
 	struct cci *cci = dev_get_drvdata(dev);
 	int ret;
 
-	ret = cci_enable_clocks(cci);
+	ret = cci_enable_io(cci);
 	if (ret)
 		return ret;
+	ret = cci_enable_clocks(cci);
+	if (ret) {
+		int cleanup = cci_disable_io(cci);
+
+		if (cleanup)
+			dev_err(dev, "failed to release I/O after clock error: %d\n",
+				cleanup);
+		return ret;
+	}
 
 	cci_init(cci);
 	return 0;
@@ -519,6 +582,14 @@ static int cci_probe(struct platform_device *pdev)
 	cci->data = device_get_match_data(dev);
 	if (!cci->data)
 		return -ENOENT;
+
+	cci->vddio = devm_regulator_get_optional(dev, "vddio");
+	if (IS_ERR(cci->vddio)) {
+		ret = PTR_ERR(cci->vddio);
+		if (ret != -ENODEV)
+			return dev_err_probe(dev, ret, "failed to get I/O supply\n");
+		cci->vddio = NULL;
+	}
 
 	for_each_available_child_of_node_scoped(dev->of_node, child) {
 		struct cci_master *master;
@@ -577,6 +648,13 @@ static int cci_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL, "not enough clocks in DT\n");
 	cci->nclocks = ret;
 
+	/* Registered before IRQ and runtime PM cleanup, so those unwind first. */
+	ret = devm_add_action_or_reset(dev, cci_release_power, cci);
+	if (ret)
+		return ret;
+	ret = cci_enable_io(cci);
+	if (ret)
+		return ret;
 	ret = cci_enable_clocks(cci);
 	if (ret < 0)
 		return ret;
@@ -617,6 +695,8 @@ static int cci_probe(struct platform_device *pdev)
 			goto error_i2c;
 	}
 
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_idle(dev);
 	return 0;
 
 error_i2c:
@@ -634,14 +714,21 @@ disable_clocks:
 static void cci_remove(struct platform_device *pdev)
 {
 	struct cci *cci = platform_get_drvdata(pdev);
-	int i;
+	int i, ret;
 
+	/* Do not access halt registers while the controller is suspended. */
+	ret = pm_runtime_resume_and_get(cci->dev);
+	if (ret < 0)
+		dev_warn(cci->dev, "failed to resume for removal: %d\n", ret);
 	for (i = 0; i < cci->data->num_masters; i++) {
 		if (cci->master[i].cci) {
 			i2c_del_adapter(&cci->master[i].adap);
-			cci_halt(cci, i);
+			if (ret >= 0)
+				cci_halt(cci, i);
 		}
 	}
+	if (ret >= 0)
+		pm_runtime_put_noidle(cci->dev);
 }
 
 static const struct cci_data cci_v1_data = {

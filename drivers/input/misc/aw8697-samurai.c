@@ -39,9 +39,6 @@ struct samurai_aw {
 	bool identified;
 	u16 applied;
 	int last_error;
-	u32 starts;
-	u32 stops;
-	u32 watchdog_stops;
 };
 
 static const struct regmap_config samurai_aw_regmap = {
@@ -64,8 +61,6 @@ static int samurai_aw_stop(struct samurai_aw *aw)
 		ret = regmap_read_poll_timeout(aw->map, AW_STATE, state,
 					       !(state & 0xf), 2000, 120000);
 	standby = regmap_update_bits(aw->map, AW_SYSCTRL, BIT(0), BIT(0));
-	if (aw->active)
-		aw->stops++;
 	aw->active = false;
 	aw->applied = 0;
 	return ret ? ret : standby;
@@ -161,7 +156,6 @@ static int samurai_aw_start(struct samurai_aw *aw, u16 strength)
 	if (!ret) {
 		aw->active = true;
 		aw->applied = strength;
-		aw->starts++;
 	}
 	return ret;
 }
@@ -186,8 +180,6 @@ static void samurai_aw_work(struct work_struct *work)
 	if (aw->faulted || suspended)
 		goto out;
 	if (!strength || time_after_eq(jiffies, deadline)) {
-		if (strength && aw->active)
-			aw->watchdog_stops++;
 		ret = samurai_aw_stop(aw);
 	} else {
 		ret = regmap_read(aw->map, AW_SYSST, &status);
@@ -274,38 +266,6 @@ static void samurai_aw_release(void *data)
 	gpiod_set_value_cansleep(aw->reset, 1);
 }
 
-static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct samurai_aw *aw = dev_get_drvdata(dev);
-	unsigned int id, go, state, sysctrl, drive;
-	int ret;
-
-	mutex_lock(&aw->io_lock);
-	ret = regmap_read(aw->map, AW_ID, &id);
-	if (!ret)
-		ret = regmap_read(aw->map, AW_GO, &go);
-	if (!ret)
-		ret = regmap_read(aw->map, AW_STATE, &state);
-	if (!ret)
-		ret = regmap_read(aw->map, AW_SYSCTRL, &sysctrl);
-	if (!ret)
-		ret = regmap_read(aw->map, 0x7b, &drive);
-	if (!ret)
-		ret = sysfs_emit(buf, "id=%02x go=%02x state=%02x sysctrl=%02x drive=%u active=%u starts=%u stops=%u watchdog_stops=%u error=%d\n",
-			id, go, state, sysctrl, drive, aw->active, aw->starts,
-			aw->stops, aw->watchdog_stops, aw->last_error);
-	mutex_unlock(&aw->io_lock);
-	return ret;
-}
-static DEVICE_ATTR_RO(status);
-static struct attribute *samurai_aw_attrs[] = {
-	&dev_attr_status.attr,
-	NULL,
-};
-static const struct attribute_group samurai_aw_group = {
-	.attrs = samurai_aw_attrs,
-};
-
 static int samurai_aw_probe(struct i2c_client *client)
 {
 	struct samurai_aw *aw;
@@ -346,9 +306,6 @@ static int samurai_aw_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 	ret = input_register_device(input);
-	if (ret)
-		return ret;
-	ret = devm_device_add_group(&client->dev, &samurai_aw_group);
 	if (ret)
 		return ret;
 	dev_info(&client->dev, "AW8697 id=97 standby; 170Hz drive ceiling=52 pulse limit=%ums\n", AW_MAX_MS);

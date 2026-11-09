@@ -93,6 +93,7 @@ enum camss_version {
 	CAMSS_8280XP,
 	CAMSS_8300,
 	CAMSS_845,
+	CAMSS_8150,
 	CAMSS_8550,
 	CAMSS_8650,
 	CAMSS_8775P,
@@ -107,6 +108,7 @@ enum icc_count {
 struct camss_resources {
 	enum camss_version version;
 	const char *pd_name;
+	bool needs_mmcx_performance;
 	const struct camss_subdev_resources *csiphy_res;
 	const struct camss_subdev_resources *tpg_res;
 	const struct camss_subdev_resources *csid_res;
@@ -136,6 +138,9 @@ struct camss {
 	int genpd_num;
 	struct device *genpd;
 	struct device_link *genpd_link;
+	struct device *mmcx_genpd;
+	struct device_link *mmcx_link;
+	bool mmcx_active;
 	struct icc_path *icc_path[ICC_SM8250_COUNT];
 	const struct camss_resources *res;
 };
@@ -169,7 +174,7 @@ int camss_enable_clocks(int nclocks, struct camss_clock *clock,
 void camss_disable_clocks(int nclocks, struct camss_clock *clock);
 struct media_pad *camss_find_sensor_pad(struct media_entity *entity);
 s64 camss_get_link_freq(struct media_entity *entity, unsigned int bpp,
-			unsigned int lanes);
+			unsigned int lanes, bool is_cphy);
 int camss_get_pixel_clock(struct media_entity *entity, u64 *pixel_clock);
 int camss_pm_domain_on(struct camss *camss, int id);
 void camss_pm_domain_off(struct camss *camss, int id);

@@ -8,6 +8,8 @@
 #include <linux/array_size.h>
 #include <linux/bits.h>
 #include <linux/device.h>
+#include <linux/iopoll.h>
+#include <linux/property.h>
 #include <linux/math.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -24,6 +26,7 @@
 
 #define LDO_VSET_LB_REG			0x40
 
+#define LDO_STATUS_REG			0x08
 #define LDO_ENABLE_REG			0x46
 #define ENABLE_BIT			BIT(7)
 
@@ -99,11 +102,32 @@ static int pm8008_regulator_get_voltage_sel(struct regulator_dev *rdev)
 	return regulator_map_voltage_linear_range(rdev, uV, INT_MAX);
 }
 
+/* Wait for the analogue rail instead of assuming the ENABLE write is enough. */
+static int pm8008_regulator_enable(struct regulator_dev *rdev)
+{
+	struct pm8008_regulator *preg = rdev_get_drvdata(rdev);
+	unsigned int value;
+	int ret, cleanup;
+
+	ret = regulator_enable_regmap(rdev);
+	if (!ret)
+		ret = regmap_read_poll_timeout(preg->regmap, preg->base + LDO_STATUS_REG,
+					       value, value & ENABLE_BIT, 100, 10000);
+	if (!ret)
+		return 0;
+	/* A failed bus write may have reached hardware; always try to undo it. */
+	cleanup = regulator_disable_regmap(rdev);
+	if (cleanup)
+		dev_err(rdev_get_dev(rdev), "failed enable rollback: %d\n", cleanup);
+	return ret;
+}
+
 static const struct regulator_ops pm8008_regulator_ops = {
-	.list_voltage		= regulator_list_voltage_linear,
+	.list_voltage		= regulator_list_voltage_linear_range,
+	.map_voltage		= regulator_map_voltage_linear_range,
 	.set_voltage_sel	= pm8008_regulator_set_voltage_sel,
 	.get_voltage_sel	= pm8008_regulator_get_voltage_sel,
-	.enable			= regulator_enable_regmap,
+	.enable			= pm8008_regulator_enable,
 	.disable		= regulator_disable_regmap,
 	.is_enabled		= regulator_is_enabled_regmap,
 };
@@ -117,6 +141,8 @@ static int pm8008_regulator_probe(struct platform_device *pdev)
 	struct regulator_desc *desc;
 	struct regulator_dev *rdev;
 	struct regmap *regmap;
+	struct device_node *regulators, *node;
+	char supply[32];
 	unsigned int val;
 	int ret, i;
 
@@ -124,8 +150,21 @@ static int pm8008_regulator_probe(struct platform_device *pdev)
 	if (!regmap)
 		return -EINVAL;
 
+	regulators = of_get_child_by_name(dev->parent->of_node, "regulators");
+	if (!regulators)
+		return -ENODEV;
+	of_node_put(regulators);
+
 	for (i = 0; i < ARRAY_SIZE(pm8008_reg_data); i++) {
 		data = &pm8008_reg_data[i];
+		regulators = of_get_child_by_name(dev->parent->of_node, "regulators");
+		node = of_get_child_by_name(regulators, data->name);
+		of_node_put(regulators);
+		if (!of_device_is_available(node)) {
+			of_node_put(node);
+			continue;
+		}
+		of_node_put(node);
 
 		preg = devm_kzalloc(dev, sizeof(*preg), GFP_KERNEL);
 		if (!preg)
@@ -137,7 +176,9 @@ static int pm8008_regulator_probe(struct platform_device *pdev)
 		desc = &preg->desc;
 
 		desc->name = data->name;
-		desc->supply_name = data->supply_name;
+		snprintf(supply, sizeof(supply), "%s-supply", data->supply_name);
+		if (device_property_present(dev->parent, supply))
+			desc->supply_name = data->supply_name;
 		desc->of_match = data->name;
 		desc->regulators_node = of_match_ptr("regulators");
 		desc->ops = &pm8008_regulator_ops;

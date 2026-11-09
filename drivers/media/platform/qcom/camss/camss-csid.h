@@ -65,6 +65,7 @@ struct csid_testgen_config {
 };
 
 struct csid_phy_config {
+	bool is_cphy;
 	u8 csiphy_id;
 	u8 lane_cnt;
 	u32 lane_assign;

@@ -21,6 +21,8 @@
 #include <linux/slab.h>
 #include <linux/videodev2.h>
 
+#include <dt-bindings/power/qcom,rpmhpd.h>
+
 #include <media/media-device.h>
 #include <media/v4l2-async.h>
 #include <media/v4l2-device.h>
@@ -1947,6 +1949,235 @@ static const struct resources_icc icc_res_sm6350[] = {
 		.name = "sf_icp_mnoc",
 		.icc_bw_tbl.avg = 2097152,
 		.icc_bw_tbl.peak = 2097152,
+	},
+};
+
+static const struct resources_icc icc_res_8150[] = {
+	{
+		.name = "cam_ahb",
+		.icc_bw_tbl.avg = 38400,
+		.icc_bw_tbl.peak = 76800,
+	},
+	{
+		.name = "cam_hf_0_mnoc",
+		.icc_bw_tbl.avg = 2097152,
+		.icc_bw_tbl.peak = 2097152,
+	},
+	{
+		.name = "cam_sf_0_mnoc",
+		.icc_bw_tbl.avg = 0,
+		.icc_bw_tbl.peak = 2097152,
+	},
+	{
+		.name = "cam_hf_0_camnoc",
+		.icc_bw_tbl.avg = 2097152,
+		.icc_bw_tbl.peak = 3000000,
+	},
+};
+
+static const struct camss_subdev_resources csiphy_res_8150[] = {
+	/* CSIPHY0 */
+	{
+		.regulators = { { .supply = "vdda-phy", .init_load_uA = 0 } },
+		.clock = { "camnoc_axi", "soc_ahb", "slow_ahb_src",
+				"cpas_ahb", "cphy_rx_src", "csiphy0",
+				"csiphy0_timer_src", "csiphy0_timer" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 19200000, 300000000 } },
+		.reg = { "csiphy0" },
+		.interrupt = { "csiphy0" },
+		.csiphy = {
+			.id = 0,
+			.hw_ops = &csiphy_ops_3ph_1_0,
+			.formats = &csiphy_formats_sdm845
+		}
+	},
+
+	/* CSIPHY1 */
+	{
+		.regulators = { { .supply = "vdda-phy", .init_load_uA = 0 } },
+		.clock = { "camnoc_axi", "soc_ahb", "slow_ahb_src",
+				"cpas_ahb", "cphy_rx_src", "csiphy1",
+				"csiphy1_timer_src", "csiphy1_timer" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 19200000, 300000000 } },
+		.reg = { "csiphy1" },
+		.interrupt = { "csiphy1" },
+		.csiphy = {
+			.id = 1,
+			.hw_ops = &csiphy_ops_3ph_1_0,
+			.formats = &csiphy_formats_sdm845
+		}
+	},
+
+	/* CSIPHY2 */
+	{
+		.regulators = { { .supply = "vdda-phy", .init_load_uA = 0 } },
+		.clock = { "camnoc_axi", "soc_ahb", "slow_ahb_src",
+				"cpas_ahb", "cphy_rx_src", "csiphy2",
+				"csiphy2_timer_src", "csiphy2_timer" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 19200000, 300000000 } },
+		.reg = { "csiphy2" },
+		.interrupt = { "csiphy2" },
+		.csiphy = {
+			.id = 2,
+			.hw_ops = &csiphy_ops_3ph_1_0,
+			.formats = &csiphy_formats_sdm845
+		}
+	},
+
+	/* CSIPHY3 */
+	{
+		.regulators = { { .supply = "vdda-phy", .init_load_uA = 0 } },
+		.clock = { "camnoc_axi", "soc_ahb", "slow_ahb_src",
+				"cpas_ahb", "cphy_rx_src", "csiphy3",
+				"csiphy3_timer_src", "csiphy3_timer" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 0 },
+				{ 19200000, 300000000 } },
+		.reg = { "csiphy3" },
+		.interrupt = { "csiphy3" },
+		.csiphy = {
+			.id = 3,
+			.hw_ops = &csiphy_ops_3ph_1_0,
+			.formats = &csiphy_formats_sdm845
+		}
+	},
+};
+
+static const struct camss_subdev_resources csid_res_8150[] = {
+	/* CSID0 */
+	{
+		.regulators = {},
+		.clock = { "cpas_ahb", "cphy_rx_src", "slow_ahb_src",
+				"soc_ahb", "vfe0", "vfe0_src",
+				"vfe0_cphy_rx", "csi0",
+				"csi0_src" },
+		.clock_rate = { { 0 },
+				{ 400000000 },
+				{ 80000000 },
+				{ 0 },
+				{ 19200000, 400000000, 558000000, 637000000, 847000000, 950000000 },
+				{ 847000000 },
+				{ 0 },
+				{ 19200000, 75000000, 400000000, 480000000, 600000000 },
+				{ 600000000 } },
+		.reg = { "csid0" },
+		.interrupt = { "csid0" },
+		.csid = {
+			.hw_ops = &csid_ops_gen2,
+			.parent_dev_ops = &vfe_parent_dev_ops,
+			.formats = &csid_formats_gen2
+		}
+	},
+
+	/* CSID1 */
+	{
+		.regulators = {},
+		.clock = { "cpas_ahb", "cphy_rx_src", "slow_ahb_src",
+				"soc_ahb", "vfe1", "vfe1_src",
+				"vfe1_cphy_rx", "csi1",
+				"csi1_src" },
+		.clock_rate = { { 0 },
+				{ 400000000 },
+				{ 80000000 },
+				{ 0 },
+				{ 19200000, 400000000, 558000000, 637000000, 847000000, 950000000 },
+				{ 847000000 },
+				{ 0 },
+				{ 19200000, 75000000, 400000000, 480000000, 600000000 },
+				{ 600000000 } },
+		.reg = { "csid1" },
+		.interrupt = { "csid1" },
+		.csid = {
+			.hw_ops = &csid_ops_gen2,
+			.parent_dev_ops = &vfe_parent_dev_ops,
+			.formats = &csid_formats_gen2
+		}
+	},
+};
+
+static const struct camss_subdev_resources vfe_res_8150[] = {
+	/* VFE0 */
+	{
+		.regulators = {},
+		.clock = { "camnoc_axi", "cpas_ahb", "gcc_camera_axi", "slow_ahb_src",
+				"soc_ahb", "vfe0", "vfe0_axi",
+				"vfe0_src", "csi0",
+				"csi0_src" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 80000000 },
+				{ 0 },
+				{ 19200000, 400000000, 558000000, 637000000, 847000000, 950000000 },
+				{ 0 },
+				{ 847000000 },
+				{ 19200000, 75000000, 400000000, 480000000, 600000000 },
+				{ 600000000 } },
+		.reg = { "vfe0" },
+		.interrupt = { "vfe0" },
+		.vfe = {
+			.line_num = 4,
+			.pd_name = "ife0",
+			.has_pd = true,
+			.hw_ops = &vfe_ops_170,
+			.formats_rdi = &vfe_formats_rdi_845,
+			.formats_pix = &vfe_formats_pix_845
+		}
+	},
+
+	/* VFE1 */
+	{
+		.regulators = {},
+		.clock = { "camnoc_axi", "cpas_ahb", "gcc_camera_axi", "slow_ahb_src",
+				"soc_ahb", "vfe1", "vfe1_axi",
+				"vfe1_src", "csi1",
+				"csi1_src" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 80000000 },
+				{ 0 },
+				{ 19200000, 400000000, 558000000, 637000000, 847000000, 950000000 },
+				{ 0 },
+				{ 847000000 },
+				{ 19200000, 75000000, 400000000, 480000000, 600000000 },
+				{ 600000000 } },
+		.reg = { "vfe1" },
+		.interrupt = { "vfe1" },
+		.vfe = {
+			.line_num = 4,
+			.pd_name = "ife1",
+			.has_pd = true,
+			.hw_ops = &vfe_ops_170,
+			.formats_rdi = &vfe_formats_rdi_845,
+			.formats_pix = &vfe_formats_pix_845
+		}
 	},
 };
 
@@ -4623,20 +4854,29 @@ struct media_pad *camss_find_sensor_pad(struct media_entity *entity)
  * camss_get_link_freq - Get link frequency from sensor
  * @entity: Media entity in the current pipeline
  * @bpp: Number of bits per pixel for the current format
- * @lanes: Number of lanes in the link to the sensor
+ * @lanes: Number of lanes or trios in the link to the sensor
+ * @is_cphy: Whether the sensor uses C-PHY encoding
  *
  * Return link frequency on success or a negative error code otherwise
  */
 s64 camss_get_link_freq(struct media_entity *entity, unsigned int bpp,
-			unsigned int lanes)
+			unsigned int lanes, bool is_cphy)
 {
 	struct media_pad *sensor_pad;
+	unsigned int mul = bpp, div = 2 * lanes;
 
+	/* C-PHY transfers 16 bits per seven symbols per trio. */
+	if (!bpp || bpp > 64 || !lanes || lanes > (is_cphy ? 3 : 4))
+		return -EINVAL;
+	if (is_cphy) {
+		mul *= 7;
+		div *= 16;
+	}
 	sensor_pad = camss_find_sensor_pad(entity);
 	if (!sensor_pad)
 		return -ENODEV;
 
-	return v4l2_get_link_freq(sensor_pad, bpp, 2 * lanes);
+	return v4l2_get_link_freq(sensor_pad, mul, div);
 }
 
 /*
@@ -4747,40 +4987,53 @@ static int camss_parse_endpoint_node(struct device *dev,
 	struct csiphy_lanes_cfg *lncfg = &csd->interface.csi2.lane_cfg;
 	struct v4l2_mbus_config_mipi_csi2 *mipi_csi2;
 	struct v4l2_fwnode_endpoint vep = { { 0 } };
-	unsigned int i;
+	unsigned int i, used = 0;
+	bool is_cphy;
 	int ret;
 
 	ret = v4l2_fwnode_endpoint_parse(ep, &vep);
 	if (ret)
 		return ret;
-
-	/*
-	 * Most SoCs support both D-PHY and C-PHY standards, but currently only
-	 * D-PHY is supported in the driver.
-	 */
-	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY) {
-		dev_err(dev, "Unsupported bus type %d\n", vep.bus_type);
+	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY &&
+	    vep.bus_type != V4L2_MBUS_CSI2_CPHY)
 		return -EINVAL;
-	}
-
-	csd->interface.csiphy_id = vep.base.port;
-
+	is_cphy = vep.bus_type == V4L2_MBUS_CSI2_CPHY;
 	mipi_csi2 = &vep.bus.mipi_csi2;
-	lncfg->clk.pos = mipi_csi2->clock_lane;
-	lncfg->clk.pol = mipi_csi2->lane_polarities[0];
-	lncfg->num_data = mipi_csi2->num_data_lanes;
+	if (!mipi_csi2->num_data_lanes ||
+	    mipi_csi2->num_data_lanes > (is_cphy ? 3 : 4))
+		return -EINVAL;
+	if (is_cphy && (fwnode_property_present(ep, "clock-lanes") ||
+			fwnode_property_present(ep, "lane-polarities")))
+		return -EINVAL;
+	if (!is_cphy) {
+		used = BIT(mipi_csi2->clock_lane);
+	}
+	for (i = 0; i < mipi_csi2->num_data_lanes; i++) {
+		unsigned int pos = mipi_csi2->data_lanes[i];
 
-	lncfg->data = devm_kcalloc(dev,
-				   lncfg->num_data, sizeof(*lncfg->data),
-				   GFP_KERNEL);
+		if (pos > (is_cphy ? 2 : 4) || (used & BIT(pos)))
+			return -EINVAL;
+		if (is_cphy && (mipi_csi2->line_orders[i] !=
+			       V4L2_MBUS_CSI2_CPHY_LINE_ORDER_ABC ||
+			       mipi_csi2->lane_polarities[i + 1]))
+			return -EINVAL;
+		used |= BIT(pos);
+	}
+	csd->interface.csiphy_id = vep.base.port;
+	lncfg->is_cphy = is_cphy;
+	if (!is_cphy) {
+		lncfg->clk.pos = mipi_csi2->clock_lane;
+		lncfg->clk.pol = mipi_csi2->lane_polarities[0];
+	}
+	lncfg->num_data = mipi_csi2->num_data_lanes;
+	lncfg->data = devm_kcalloc(dev, lncfg->num_data,
+				 sizeof(*lncfg->data), GFP_KERNEL);
 	if (!lncfg->data)
 		return -ENOMEM;
-
 	for (i = 0; i < lncfg->num_data; i++) {
 		lncfg->data[i].pos = mipi_csi2->data_lanes[i];
 		lncfg->data[i].pol = mipi_csi2->lane_polarities[i + 1];
 	}
-
 	return 0;
 }
 
@@ -5300,10 +5553,38 @@ static int camss_configure_pd(struct camss *camss)
 		goto fail_pm;
 	}
 
+	if (res->needs_mmcx_performance) {
+		camss->mmcx_genpd = dev_pm_domain_attach_by_name(dev, "mmcx");
+		if (IS_ERR(camss->mmcx_genpd)) {
+			ret = PTR_ERR(camss->mmcx_genpd);
+			camss->mmcx_genpd = NULL;
+			goto fail_link;
+		}
+		if (!camss->mmcx_genpd) {
+			ret = -ENODEV;
+			goto fail_link;
+		}
+
+		camss->mmcx_link = device_link_add(dev, camss->mmcx_genpd,
+						   DL_FLAG_STATELESS |
+						   DL_FLAG_PM_RUNTIME);
+		if (!camss->mmcx_link) {
+			ret = -EINVAL;
+			goto fail_mmcx;
+		}
+	}
+
 	return 0;
 
+fail_mmcx:
+	dev_pm_domain_detach(camss->mmcx_genpd, true);
+	camss->mmcx_genpd = NULL;
+fail_link:
+	device_link_del(camss->genpd_link);
+	camss->genpd_link = NULL;
 fail_pm:
 	dev_pm_domain_detach(camss->genpd, true);
+	camss->genpd = NULL;
 
 	return ret;
 }
@@ -5333,12 +5614,54 @@ static void camss_genpd_subdevice_cleanup(struct camss *camss)
 		msm_vfe_genpd_cleanup(&camss->vfe[i]);
 }
 
+static int camss_mmcx_get(struct camss *camss)
+{
+	int ret;
+
+	if (!camss->mmcx_genpd)
+		return 0;
+
+	ret = dev_pm_genpd_set_performance_state(camss->mmcx_genpd,
+						 RPMH_REGULATOR_LEVEL_TURBO);
+	if (ret)
+		return ret;
+
+	ret = pm_runtime_get_sync(camss->mmcx_genpd);
+	if (ret < 0) {
+		pm_runtime_put_noidle(camss->mmcx_genpd);
+		dev_pm_genpd_set_performance_state(camss->mmcx_genpd, 0);
+		return ret;
+	}
+
+	camss->mmcx_active = true;
+	return 0;
+}
+
+static void camss_mmcx_put(struct camss *camss)
+{
+	if (!camss->mmcx_active)
+		return;
+
+	if (dev_pm_genpd_set_performance_state(camss->mmcx_genpd, 0))
+		dev_err(camss->dev, "Failed to release MMCX performance state\n");
+
+	pm_runtime_put(camss->mmcx_genpd);
+	camss->mmcx_active = false;
+}
+
 static void camss_genpd_cleanup(struct camss *camss)
 {
 	if (camss->genpd_num == 1)
 		return;
 
 	camss_genpd_subdevice_cleanup(camss);
+
+	camss_mmcx_put(camss);
+
+	if (camss->mmcx_link)
+		device_link_del(camss->mmcx_link);
+	if (camss->mmcx_genpd)
+		dev_pm_domain_detach(camss->mmcx_genpd, true);
 
 	if (camss->genpd_link)
 		device_link_del(camss->genpd_link);
@@ -5655,6 +5978,20 @@ static const struct camss_resources sm6350_resources = {
 	.vfe_num = ARRAY_SIZE(vfe_res_sm6350),
 };
 
+static const struct camss_resources sm8150_resources = {
+	.version = CAMSS_8150,
+	.pd_name = "top",
+	.needs_mmcx_performance = true,
+	.csiphy_res = csiphy_res_8150,
+	.csid_res = csid_res_8150,
+	.vfe_res = vfe_res_8150,
+	.icc_res = icc_res_8150,
+	.csiphy_num = ARRAY_SIZE(csiphy_res_8150),
+	.csid_num = ARRAY_SIZE(csid_res_8150),
+	.vfe_num = ARRAY_SIZE(vfe_res_8150),
+	.icc_path_num = ARRAY_SIZE(icc_res_8150),
+};
+
 static const struct camss_resources sm8250_resources = {
 	.version = CAMSS_8250,
 	.pd_name = "top",
@@ -5754,6 +6091,7 @@ static const struct of_device_id camss_dt_match[] = {
 	{ .compatible = "qcom,sdm845-camss", .data = &sdm845_resources },
 	{ .compatible = "qcom,sm6150-camss", .data = &sm6150_resources },
 	{ .compatible = "qcom,sm6350-camss", .data = &sm6350_resources },
+	{ .compatible = "qcom,sm8150-camss", .data = &sm8150_resources },
 	{ .compatible = "qcom,sm8250-camss", .data = &sm8250_resources },
 	{ .compatible = "qcom,sm8550-camss", .data = &sm8550_resources },
 	{ .compatible = "qcom,sm8650-camss", .data = &sm8650_resources },
@@ -5771,9 +6109,16 @@ static int __maybe_unused camss_runtime_suspend(struct device *dev)
 
 	for (i = 0; i < camss->res->icc_path_num; i++) {
 		ret = icc_set_bw(camss->icc_path[i], 0, 0);
-		if (ret)
+		if (ret) {
+			while (i--)
+				icc_set_bw(camss->icc_path[i],
+					   camss->res->icc_res[i].icc_bw_tbl.avg,
+					   camss->res->icc_res[i].icc_bw_tbl.peak);
 			return ret;
+		}
 	}
+
+	camss_mmcx_put(camss);
 
 	return 0;
 }
@@ -5785,15 +6130,27 @@ static int __maybe_unused camss_runtime_resume(struct device *dev)
 	int i;
 	int ret;
 
+	ret = camss_mmcx_get(camss);
+	if (ret)
+		return ret;
+
 	for (i = 0; i < camss->res->icc_path_num; i++) {
 		ret = icc_set_bw(camss->icc_path[i],
 				 icc_res[i].icc_bw_tbl.avg,
 				 icc_res[i].icc_bw_tbl.peak);
-		if (ret)
-			return ret;
+		if (ret) {
+			while (i--)
+				icc_set_bw(camss->icc_path[i], 0, 0);
+			goto release_mmcx;
+		}
 	}
 
 	return 0;
+
+release_mmcx:
+	camss_mmcx_put(camss);
+
+	return ret;
 }
 
 static const struct dev_pm_ops camss_pm_ops = {

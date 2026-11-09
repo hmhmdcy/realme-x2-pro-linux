@@ -94,8 +94,11 @@ static int video_get_subdev_format(struct camss_video *video,
 	int ret;
 
 	subdev = video_remote_subdev(video, &pad);
-	if (subdev == NULL)
+	if (!subdev) {
+		dev_err(video->camss->dev, "%s: no remote subdevice\n",
+			video->vdev.name);
 		return -EPIPE;
+	}
 
 	fmt.pad = pad;
 
@@ -228,8 +231,15 @@ static int video_check_format(struct camss_video *video)
 	    pix->height != sd_pix->height ||
 	    pix->width != sd_pix->width ||
 	    pix->num_planes != sd_pix->num_planes ||
-	    pix->field != format.fmt.pix_mp.field)
+	    pix->field != format.fmt.pix_mp.field) {
+		dev_err(video->camss->dev,
+			"%s: format mismatch: subdev %ux%u %p4cc/%up field:%u, video %ux%u %p4cc/%up field:%u\n",
+			video->vdev.name, sd_pix->width, sd_pix->height,
+			&sd_pix->pixelformat, sd_pix->num_planes, sd_pix->field,
+			pix->width, pix->height, &pix->pixelformat,
+			pix->num_planes, pix->field);
 		return -EPIPE;
+	}
 
 	return 0;
 }
@@ -289,6 +299,8 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 
 error:
+	dev_err(video->camss->dev, "%s: failed to start streaming: %d\n",
+		video->vdev.name, ret);
 	video_device_pipeline_stop(vdev);
 
 flush_buffers:

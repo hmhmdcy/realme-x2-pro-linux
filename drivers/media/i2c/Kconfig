@@ -794,6 +794,23 @@ config VIDEO_S5C73M3
 	  This is a V4L2 sensor driver for Samsung S5C73M3
 	  8 Mpixel camera.
 
+config VIDEO_LC898219XI
+	tristate "ON Semiconductor LC898219XI lens controller"
+	depends on I2C && VIDEO_DEV && PM
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	help
+	  This is a V4L2 lens driver for the ON Semiconductor LC898219XI
+	  autofocus controller. It provides absolute focus position control.
+
+config VIDEO_S5KGW1
+	tristate "Samsung S5KGW1 sensor support"
+	depends on I2C
+	select V4L2_CCI_I2C
+	help
+	  V4L2 support for the Samsung S5KGW1 RAW10 camera sensor with
+	  a 19.2 MHz input clock and a three-trio MIPI C-PHY interface.
+
 config VIDEO_S5K3M5
 	tristate "Samsung S5K3M5 sensor support"
 	select V4L2_CCI_I2C
