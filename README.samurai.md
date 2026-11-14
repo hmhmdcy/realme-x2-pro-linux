@@ -25,6 +25,36 @@ build `#8`.  Its source patch set is recorded in the integration
 repository; do not assume that a newer upstream kernel or a different
 module tree is compatible.
 
+## Kernel #8 build inputs
+
+The published release is `v2026.11.14-kernel8`.  Use the full
+configuration committed as `samurai.config.kernel8`; it is the
+generated `.config` from the build that produced the published Image
+(`29c8d27c64b9f3bb11bbf6b94bcd211e88aa3ad4a8d31955b37b54d622d8a739`).
+
+Reproduce the compile environment as closely as possible:
+
+```sh
+git clone --branch stable \
+  https://github.com/hmhmdcy/realme-x2-pro-linux.git
+cd realme-x2-pro-linux
+make O=/fixed/linux-kernel8-build ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- KCONFIG_ALLCONFIG=$PWD/samurai.config.kernel8 \
+  allnoconfig
+make O=/fixed/linux-kernel8-build ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image modules
+```
+
+The recorded compiler was GCC 15.2.0 with GNU ld 2.46; a different
+toolchain can produce a different Image hash even with identical source
+and configuration.  Use a fixed absolute `O=` path.  This is a
+source/config reproduction recipe, not a promise of bit-identical
+output.  Verify the result against the release manifest rather than
+publishing a local Image as kernel #8.
+
+The matching module archive is a separate release asset and must be
+installed under `/lib/modules/7.3.1-rmx1931-samurai-v731-usbwake-otg`.
+
 ## Boundaries
 
 - Kernel build must match the deployed module release and DTB.
