@@ -212,6 +212,46 @@ fail:
 	return rc ? rc : -EFAULT;
 }
 
+static void dpu_rm_clear_dsc_boot_config(struct dpu_rm *rm,
+					 const struct dpu_mdss_cfg *cat)
+{
+	int i;
+
+	for (i = 0; i < cat->pingpong_count; i++) {
+		struct dpu_hw_blk *blk;
+		struct dpu_hw_pingpong *pp;
+		int idx = cat->pingpong[i].id - PINGPONG_0;
+
+		blk = rm->pingpong_blks[idx];
+		if (!blk)
+			continue;
+
+		pp = to_dpu_hw_pingpong(blk);
+		if (pp->ops.disable_dsc)
+			pp->ops.disable_dsc(pp);
+	}
+
+	for (i = 0; i < cat->dsc_count; i++) {
+		struct dpu_hw_blk *blk;
+		struct dpu_hw_dsc *dsc;
+		int idx = cat->dsc[i].id - DSC_0;
+
+		blk = rm->dsc_blks[idx];
+		if (!blk)
+			continue;
+
+		dsc = to_dpu_hw_dsc(blk);
+		if (dsc->ops.dsc_disable)
+			dsc->ops.dsc_disable(dsc);
+		if (dsc->ops.dsc_bind_pingpong_blk)
+			dsc->ops.dsc_bind_pingpong_blk(dsc, PINGPONG_NONE);
+	}
+
+	if (cat->dsc_count)
+		pr_info("boot DSC cleared: pingpong=%d dsc=%d\n",
+			cat->pingpong_count, cat->dsc_count);
+}
+
 int dpu_rm_clear_boot_config(struct dpu_rm *rm, const struct dpu_mdss_cfg *cat)
 {
 	int i, ret;
@@ -238,6 +278,8 @@ int dpu_rm_clear_boot_config(struct dpu_rm *rm, const struct dpu_mdss_cfg *cat)
 		if (ret < 0)
 			return ret;
 	}
+
+	dpu_rm_clear_dsc_boot_config(rm, cat);
 
 	/* Never change domains with a stalled frame and no confirmed CMD reset. */
 	if (stalled_intfs & ~cleared_intfs)

@@ -61,5 +61,3 @@ obj-$(CONFIG_USB_DWC3_OCTEON)		+= dwc3-octeon.o
 obj-$(CONFIG_USB_DWC3_RTK)		+= dwc3-rtk.o
 obj-$(CONFIG_USB_DWC3_GENERIC_PLAT)	+= dwc3-generic-plat.o
 obj-$(CONFIG_USB_DWC3_GOOGLE)		+= dwc3-google.o
-
-dwc3-$(CONFIG_USB_DWC3_SAMURAI_APSD_OWNER) += samurai-apsd-owner.o

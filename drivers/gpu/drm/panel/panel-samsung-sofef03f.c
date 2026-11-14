@@ -9,7 +9,9 @@
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
+#include <linux/workqueue.h>
 
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
@@ -19,6 +21,7 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
 #include <drm/drm_probe_helper.h>
+#include <video/mipi_display.h>
 
 struct sofef03f {
 	struct drm_panel panel;
@@ -32,6 +35,13 @@ struct sofef03f {
 	bool supply_enabled[2];
 	bool prefer_90;
 	bool active_90;
+	struct delayed_work backlight_work;
+	unsigned int backlight_retries;
+	bool post_on_sent;
+	bool backlight_reapplied;
+	unsigned int last_brightness;
+	bool hbm_enabled;
+	struct mutex lock;
 };
 
 static const struct regulator_bulk_data sofef03f_supplies[] = {
@@ -61,6 +71,108 @@ module_param_named(refresh, sofef03f_refresh, int, 0444);
 MODULE_PARM_DESC(refresh, "Preferred panel refresh rate (60 or 90)");
 
 static bool sofef03f_active_90hz(struct sofef03f *ctx);
+
+static int sofef03f_write_brightness_locked(struct sofef03f *ctx)
+{
+	struct backlight_device *bl = ctx->panel.backlight;
+	unsigned int mode_flags = ctx->dsi->mode_flags;
+	unsigned int brightness = backlight_get_brightness(bl);
+	bool use_hbm = brightness > 1023;
+	u8 hbm_value;
+	int ret;
+
+	if (!ctx->panel.prepared || !READ_ONCE(ctx->panel.backlight_ready))
+		return 0;
+
+	if (!ctx->post_on_sent) {
+		/* Stock post-on-backlight is dsi_hs_mode. */
+		ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+		ret = mipi_dsi_dcs_set_display_on(ctx->dsi);
+		ctx->dsi->mode_flags = mode_flags;
+		if (ret < 0) {
+			dev_warn(&ctx->dsi->dev,
+				 "Post-on display-on failed: %d\n", ret);
+			return ret;
+		}
+		usleep_range(20000, 21000);
+		ctx->post_on_sent = true;
+		dev_info(&ctx->dsi->dev, "post-on display-on completed\n");
+	}
+
+	if (use_hbm && !ctx->hbm_enabled) {
+		hbm_value = 0xe0;
+		ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+		ret = mipi_dsi_dcs_write(ctx->dsi, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+					 &hbm_value, sizeof(hbm_value));
+		ctx->dsi->mode_flags = mode_flags;
+		if (ret < 0) {
+			dev_warn(&ctx->dsi->dev,
+				 "HBM enable failed: %d\n", ret);
+			return ret;
+		}
+		ctx->hbm_enabled = true;
+	}
+
+	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	ret = mipi_dsi_dcs_set_display_brightness_large(ctx->dsi, brightness);
+	ctx->dsi->mode_flags = mode_flags;
+	if (ret < 0) {
+		dev_warn(&ctx->dsi->dev,
+			 "Brightness write %u failed: %d\n", brightness, ret);
+		return ret;
+	}
+	if (brightness != ctx->last_brightness) {
+		dev_info(&ctx->dsi->dev, "brightness wrote %u\n", brightness);
+		ctx->last_brightness = brightness;
+	}
+
+	if (!use_hbm && ctx->hbm_enabled) {
+		hbm_value = 0x20;
+		ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+		ret = mipi_dsi_dcs_write(ctx->dsi, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+					 &hbm_value, sizeof(hbm_value));
+		ctx->dsi->mode_flags = mode_flags;
+		if (ret < 0) {
+			dev_warn(&ctx->dsi->dev,
+				 "HBM disable failed: %d\n", ret);
+			return ret;
+		}
+		ctx->hbm_enabled = false;
+	}
+	return 0;
+}
+
+static void sofef03f_backlight_work(struct work_struct *work)
+{
+	struct sofef03f *ctx = container_of(work, struct sofef03f,
+					    backlight_work.work);
+	int ret;
+
+	mutex_lock(&ctx->lock);
+	if (!ctx->panel.prepared) {
+		mutex_unlock(&ctx->lock);
+		return;
+	}
+	if (!READ_ONCE(ctx->panel.backlight_ready)) {
+		if (ctx->backlight_retries++ < 5)
+			schedule_delayed_work(&ctx->backlight_work,
+					      msecs_to_jiffies(100));
+		mutex_unlock(&ctx->lock);
+		return;
+	}
+
+	ret = sofef03f_write_brightness_locked(ctx);
+	if (ret < 0) {
+		if (ctx->backlight_retries++ < 5)
+			schedule_delayed_work(&ctx->backlight_work,
+					      msecs_to_jiffies(100));
+	} else if (!ctx->backlight_reapplied) {
+		ctx->backlight_reapplied = true;
+		schedule_delayed_work(&ctx->backlight_work,
+				      msecs_to_jiffies(400));
+	}
+	mutex_unlock(&ctx->lock);
+}
 
 static int sofef03f_on(struct sofef03f *ctx)
 {
@@ -175,10 +287,11 @@ static void sofef03f_supply_disable(struct sofef03f *ctx, unsigned int index)
 static void sofef03f_power_off(struct sofef03f *ctx)
 {
 	gpiod_set_value_cansleep(ctx->reset, 1);
-	usleep_range(12000, 15000);
+	usleep_range(22000, 22500);
 	gpiod_set_value_cansleep(ctx->vddd, 0);
-	usleep_range(2000, 7000);
+	usleep_range(1000, 1100);
 	gpiod_set_value_cansleep(ctx->vci, 0);
+	usleep_range(1000, 1100);
 	sofef03f_supply_disable(ctx, 1);
 	sofef03f_supply_disable(ctx, 0);
 }
@@ -216,9 +329,10 @@ static int sofef03f_prepare(struct drm_panel *panel)
 		return ret;
 	}
 	gpiod_set_value_cansleep(ctx->vci, 1);
-	usleep_range(1000, 5000);
+	/* Stock OPLUS values are microseconds, not milliseconds. */
+	usleep_range(1000, 1100);
 	gpiod_set_value_cansleep(ctx->vddd, 1);
-	usleep_range(1000, 12000);
+	usleep_range(1000, 1100);
 	/* Logical reset is active low: stock raw levels 1/0/1, 5/10/10 ms. */
 	gpiod_set_value_cansleep(ctx->reset, 0);
 	usleep_range(5000, 5100);
@@ -229,25 +343,28 @@ static int sofef03f_prepare(struct drm_panel *panel)
 	ret = sofef03f_on(ctx);
 	if (ret)
 		sofef03f_power_off(ctx);
+	else
+		dev_info(&ctx->dsi->dev, "panel initialization complete\n");
 	return ret;
 }
 
 static int sofef03f_enable(struct drm_panel *panel)
 {
 	struct sofef03f *ctx = to_sofef03f(panel);
-	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
-	u8 power_mode;
-	int ret;
 
-	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
-	mipi_dsi_msleep(&dsi_ctx, 20);
-	if (dsi_ctx.accum_err)
-		return dsi_ctx.accum_err;
-	ret = mipi_dsi_dcs_get_power_mode(ctx->dsi, &power_mode);
-	if (ret < 0)
-		return ret;
-	dev_info(&ctx->dsi->dev, "DSC 1080x2400@%d, power mode 0x%02x (stock 0x9c)\n",
-		 ctx->active_90 ? 90 : 60, power_mode);
+	/*
+	 * Stock 19781 keeps display-on out of the LP on-command and sends it
+	 * from post-on-backlight in HS mode after the first frame.
+	 */
+	mutex_lock(&ctx->lock);
+	ctx->backlight_retries = 0;
+	ctx->post_on_sent = false;
+	ctx->backlight_reapplied = false;
+	ctx->last_brightness = ~0U;
+	ctx->hbm_enabled = false;
+	mutex_unlock(&ctx->lock);
+	schedule_delayed_work(&ctx->backlight_work,
+			      msecs_to_jiffies(100));
 	return 0;
 }
 
@@ -255,13 +372,30 @@ static int sofef03f_disable(struct drm_panel *panel)
 {
 	struct sofef03f *ctx = to_sofef03f(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	struct mipi_dsi_multi_context pre_off = { .dsi = ctx->dsi };
 
+	cancel_delayed_work_sync(&ctx->backlight_work);
+	mutex_lock(&ctx->lock);
+	ctx->backlight_retries = 0;
+	ctx->post_on_sent = false;
+	ctx->backlight_reapplied = false;
+	/*
+	 * Stock off-command is display-on, display-off, sleep-in.  Keep the
+	 * leading display-on even though the panel is already on; the DDIC
+	 * needs this sequence before the next prepare/sleep-out.
+	 */
+	mipi_dsi_dcs_set_display_on_multi(&pre_off);
+	mipi_dsi_msleep(&pre_off, 20);
+	if (pre_off.accum_err)
+		dev_warn(&ctx->dsi->dev, "Pre-off display-on failed: %d\n",
+			 pre_off.accum_err);
 	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
 	/* Shutdown must progress to unprepare, including after a DCS timeout. */
 	msleep(22);
 	if (dsi_ctx.accum_err)
 		dev_warn(&ctx->dsi->dev, "Display-off failed: %d; forcing teardown\n",
 			 dsi_ctx.accum_err);
+	mutex_unlock(&ctx->lock);
 	return 0;
 }
 
@@ -270,6 +404,7 @@ static int sofef03f_unprepare(struct drm_panel *panel)
 	struct sofef03f *ctx = to_sofef03f(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 
+	mutex_lock(&ctx->lock);
 	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
 	/* Preserve the stock wait even if the command bus is unresponsive. */
 	msleep(120);
@@ -278,6 +413,7 @@ static int sofef03f_unprepare(struct drm_panel *panel)
 		dev_warn(&ctx->dsi->dev, "Sleep failed: %d; panel reset and power removed\n",
 			 dsi_ctx.accum_err);
 	/* Reset and VCI/VDDD are off: DRM must allow the next prepare/enable. */
+	mutex_unlock(&ctx->lock);
 	return 0;
 }
 
@@ -377,13 +513,12 @@ static const struct drm_panel_funcs sofef03f_funcs = {
 static int sofef03f_bl_update(struct backlight_device *bl)
 {
 	struct sofef03f *ctx = bl_get_data(bl);
+	int ret;
 
-	if (!ctx->panel.prepared)
-		return 0;
-	if (backlight_get_brightness(bl) && !READ_ONCE(ctx->panel.backlight_ready))
-		return 0;
-	return mipi_dsi_dcs_set_display_brightness_large(ctx->dsi,
-						      backlight_get_brightness(bl));
+	mutex_lock(&ctx->lock);
+	ret = sofef03f_write_brightness_locked(ctx);
+	mutex_unlock(&ctx->lock);
+	return ret;
 }
 
 static const struct backlight_ops sofef03f_bl_ops = {
@@ -408,6 +543,8 @@ static int sofef03f_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 	ctx->dsi = dsi;
+	mutex_init(&ctx->lock);
+	INIT_DELAYED_WORK(&ctx->backlight_work, sofef03f_backlight_work);
 	ctx->prefer_90 = sofef03f_refresh == 90;
 	ctx->active_90 = ctx->prefer_90;
 	ret = devm_regulator_bulk_get_const(dev, ARRAY_SIZE(sofef03f_supplies),
@@ -457,6 +594,7 @@ static void sofef03f_remove(struct mipi_dsi_device *dsi)
 {
 	struct sofef03f *ctx = mipi_dsi_get_drvdata(dsi);
 
+	cancel_delayed_work_sync(&ctx->backlight_work);
 	mipi_dsi_detach(dsi);
 	drm_panel_remove(&ctx->panel);
 }

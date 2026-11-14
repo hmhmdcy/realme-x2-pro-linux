@@ -134,6 +134,23 @@ static void qcom_pmic_typec_remove(struct platform_device *pdev)
 	fwnode_handle_put(tcpm->tcpc.fwnode);
 }
 
+static int qcom_pmic_typec_suspend(struct device *dev)
+{
+	struct pmic_typec *tcpm = dev_get_drvdata(dev);
+
+	return qcom_pmic_typec_port_suspend(tcpm);
+}
+
+static int qcom_pmic_typec_resume(struct device *dev)
+{
+	struct pmic_typec *tcpm = dev_get_drvdata(dev);
+
+	return qcom_pmic_typec_port_resume(tcpm);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(qcom_pmic_typec_pm_ops,
+				qcom_pmic_typec_suspend, qcom_pmic_typec_resume);
+
 static const struct pmic_typec_resources pm8150b_typec_res = {
 	.pdphy_res = &pm8150b_pdphy_res,
 	.port_res = &pm8150b_port_res,
@@ -155,6 +172,7 @@ static struct platform_driver qcom_pmic_typec_driver = {
 	.driver = {
 		.name = "qcom,pmic-typec",
 		.of_match_table = qcom_pmic_typec_table,
+		.pm = pm_sleep_ptr(&qcom_pmic_typec_pm_ops),
 	},
 	.probe = qcom_pmic_typec_probe,
 	.remove = qcom_pmic_typec_remove,

@@ -10,10 +10,11 @@ maintainers:
   - Samurai Linux port maintainers <samurai-linux@example.com>
 
 description: |
-  The MP2650 is an I2C battery charger. The Samurai driver currently exposes
-  read-only input voltage, input current, input presence and charging status.
-  Registering the device does not reset or configure the charger. Board charge
-  policy, input power budgets and protection must be handled separately.
+  The MP2650 is an I2C battery charger. The Samurai driver exposes input
+  voltage, input current, input presence, charging status and, when the board
+  provides the OTG pin and a usb-otg-vbus child, the standard VBUS regulator
+  used by a USB Type-C source port. Charging current, voltage, BATFET and
+  protection configuration remain board policy.
 
 allOf:
   - $ref: power-supply.yaml#
@@ -24,6 +25,19 @@ properties:
 
   reg:
     maxItems: 1
+
+  otg-gpios:
+    description:
+      GPIO connected to the MP2650 OTG/CMIN pin. The pin is driven high while
+      the OTG boost is enabled.
+    maxItems: 1
+
+  usb-otg-vbus:
+    $ref: /schemas/regulator/regulator.yaml#
+    description:
+      Regulator node controlling the MP2650 OTG boost output. The regulator
+      enable path releases CHG_EN, asserts REG08.OTG_EN and drives otg-gpios
+      high; disable restores the saved REG08 value and drives the pin low.
 
 required:
   - compatible
@@ -40,5 +54,13 @@ examples:
         charger@5c {
             compatible = "mps,mp2650";
             reg = <0x5c>;
+            otg-gpios = <&gpio 4 GPIO_ACTIVE_HIGH>;
+
+            usb-otg-vbus {
+                regulator-name = "mp2650-vbus";
+                regulator-min-microvolt = <5000000>;
+                regulator-max-microvolt = <5000000>;
+                regulator-enable-ramp-delay = <750000>;
+            };
         };
     };

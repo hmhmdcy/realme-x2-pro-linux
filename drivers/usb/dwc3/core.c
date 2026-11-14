@@ -1874,6 +1874,9 @@ static void dwc3_get_properties(struct dwc3 *dwc)
 	dwc->dis_split_quirk = device_property_read_bool(dev,
 				"snps,dis-split-quirk");
 
+	dwc->gadget_keep_connect_sys_sleep = device_property_read_bool(dev,
+				"snps,gadget-keep-connect-sys-sleep");
+
 	dwc->lpm_nyet_threshold = lpm_nyet_threshold;
 	dwc->tx_de_emphasis = tx_de_emphasis;
 
@@ -2566,7 +2569,8 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 		if (ret)
 			return ret;
 		synchronize_irq(dwc->irq_gadget);
-		dwc3_core_exit(dwc);
+		if (!dwc3_gadget_keep_connect(dwc))
+			dwc3_core_exit(dwc);
 		break;
 	case DWC3_GCTL_PRTCAP_HOST:
 		if (!PMSG_IS_AUTO(msg) &&
@@ -2625,12 +2629,27 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 
 	switch (dwc->current_dr_role) {
 	case DWC3_GCTL_PRTCAP_DEVICE:
+		if (dwc3_gadget_keep_connect(dwc)) {
+			ret = dwc3_gadget_resume(dwc);
+			if (!ret)
+				break;
+			if (ret != -EAGAIN)
+				return ret;
+
+			dev_info(dwc->dev,
+				 "keep-connect wake was a cable event; reinitialising\n");
+			dwc->keep_connect_fallback = true;
+		}
+
 		ret = dwc3_core_init_for_resume(dwc);
-		if (ret)
+		if (ret) {
+			dwc->keep_connect_fallback = false;
 			return ret;
+		}
 
 		dwc3_set_prtcap(dwc, DWC3_GCTL_PRTCAP_DEVICE, true);
 		dwc3_gadget_resume(dwc);
+		dwc->keep_connect_fallback = false;
 		break;
 	case DWC3_GCTL_PRTCAP_HOST:
 		if (!PMSG_IS_AUTO(msg) &&
@@ -2797,7 +2816,8 @@ int dwc3_pm_suspend(struct dwc3 *dwc)
 	if (ret)
 		return ret;
 
-	pinctrl_pm_select_sleep_state(dev);
+	if (!dwc3_gadget_keep_connect(dwc))
+		pinctrl_pm_select_sleep_state(dev);
 
 	return 0;
 }
@@ -2808,7 +2828,8 @@ int dwc3_pm_resume(struct dwc3 *dwc)
 	struct device *dev = dwc->dev;
 	int		ret = 0;
 
-	pinctrl_pm_select_default_state(dev);
+	if (!dwc3_gadget_keep_connect(dwc))
+		pinctrl_pm_select_default_state(dev);
 
 	pm_runtime_disable(dev);
 	ret = pm_runtime_set_active(dev);

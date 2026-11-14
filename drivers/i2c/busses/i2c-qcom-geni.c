@@ -1046,14 +1046,22 @@ static int setup_gpi_dma(struct geni_i2c_dev *gi2c)
 	geni_se_select_mode(&gi2c->se, GENI_GPI_DMA);
 	gi2c->tx_c = dma_request_chan(gi2c->se.dev, "tx");
 	if (IS_ERR(gi2c->tx_c)) {
-		ret = dev_err_probe(gi2c->se.dev, PTR_ERR(gi2c->tx_c),
+		ret = PTR_ERR(gi2c->tx_c);
+		if (ret == -ENODEV &&
+		    device_property_present(gi2c->se.dev, "dmas"))
+			ret = -EPROBE_DEFER;
+		ret = dev_err_probe(gi2c->se.dev, ret,
 				    "Failed to get tx DMA ch\n");
 		goto err_tx;
 	}
 
 	gi2c->rx_c = dma_request_chan(gi2c->se.dev, "rx");
 	if (IS_ERR(gi2c->rx_c)) {
-		ret = dev_err_probe(gi2c->se.dev, PTR_ERR(gi2c->rx_c),
+		ret = PTR_ERR(gi2c->rx_c);
+		if (ret == -ENODEV &&
+		    device_property_present(gi2c->se.dev, "dmas"))
+			ret = -EPROBE_DEFER;
+		ret = dev_err_probe(gi2c->se.dev, ret,
 				    "Failed to get rx DMA ch\n");
 		goto err_rx;
 	}

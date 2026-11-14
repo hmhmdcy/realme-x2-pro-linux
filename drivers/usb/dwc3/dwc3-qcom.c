@@ -81,6 +81,7 @@ struct dwc3_qcom {
 	enum usb_dr_mode	mode;
 	bool			is_suspended;
 	bool			pm_suspended;
+	bool			keep_connect;
 	bool			utmi_as_pipe_clk;
 	struct icc_path		*icc_path_ddr;
 	struct icc_path		*icc_path_apps;
@@ -252,6 +253,18 @@ static enum usb_device_speed dwc3_qcom_read_usb2_speed(struct dwc3_qcom *qcom, i
 	return udev->speed;
 }
 
+static enum usb_device_speed
+dwc3_qcom_get_usb2_speed(struct dwc3_qcom *qcom, int port_index)
+{
+	if (dwc3_qcom_is_host(qcom))
+		return dwc3_qcom_read_usb2_speed(qcom, port_index);
+
+	if (qcom->dwc.gadget)
+		return qcom->dwc.gadget->speed;
+
+	return USB_SPEED_UNKNOWN;
+}
+
 static void dwc3_qcom_enable_wakeup_irq(int irq, unsigned int polarity)
 {
 	if (!irq)
@@ -260,6 +273,7 @@ static void dwc3_qcom_enable_wakeup_irq(int irq, unsigned int polarity)
 	if (polarity)
 		irq_set_irq_type(irq, polarity);
 
+	irq_set_irqchip_state(irq, IRQCHIP_STATE_PENDING, false);
 	enable_irq(irq);
 	enable_irq_wake(irq);
 }
@@ -357,31 +371,39 @@ static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
 {
 	u32 val;
 	int i, ret;
+	bool keep_connect;
 
 	if (qcom->is_suspended)
 		return 0;
 
-	for (i = 0; i < qcom->num_ports; i++) {
-		val = readl(qcom->qscratch_base + pwr_evnt_irq_stat_reg[i]);
-		if (!(val & PWR_EVNT_LPM_IN_L2_MASK))
-			dev_err(qcom->dev, "port-%d HS-PHY not in L2\n", i + 1);
-	}
-	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
+	keep_connect = wakeup && !dwc3_qcom_is_host(qcom) &&
+		       dwc3_gadget_keep_connect(&qcom->dwc);
 
-	ret = dwc3_qcom_interconnect_disable(qcom);
-	if (ret)
-		dev_warn(qcom->dev, "failed to disable interconnect: %d\n", ret);
+	if (!keep_connect) {
+		for (i = 0; i < qcom->num_ports; i++) {
+			val = readl(qcom->qscratch_base + pwr_evnt_irq_stat_reg[i]);
+			if (!(val & PWR_EVNT_LPM_IN_L2_MASK))
+				dev_err(qcom->dev, "port-%d HS-PHY not in L2\n", i + 1);
+		}
+		clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
+
+		ret = dwc3_qcom_interconnect_disable(qcom);
+		if (ret)
+			dev_warn(qcom->dev, "failed to disable interconnect: %d\n", ret);
+	}
 
 	/*
 	 * The role is stable during suspend as role switching is done from a
 	 * freezable workqueue.
 	 */
-	if (dwc3_qcom_is_host(qcom) && wakeup) {
+	if (keep_connect || (dwc3_qcom_is_host(qcom) && wakeup)) {
 		for (i = 0; i < qcom->num_ports; i++)
-			qcom->ports[i].usb2_speed = dwc3_qcom_read_usb2_speed(qcom, i);
+			qcom->ports[i].usb2_speed =
+				dwc3_qcom_get_usb2_speed(qcom, i);
 		dwc3_qcom_enable_interrupts(qcom);
 	}
 
+	qcom->keep_connect = keep_connect;
 	qcom->is_suspended = true;
 
 	return 0;
@@ -391,23 +413,28 @@ static int dwc3_qcom_resume(struct dwc3_qcom *qcom, bool wakeup)
 {
 	int ret;
 	int i;
+	bool keep_connect;
 
 	if (!qcom->is_suspended)
 		return 0;
 
-	if (dwc3_qcom_is_host(qcom) && wakeup)
+	keep_connect = qcom->keep_connect;
+
+	if (keep_connect || (dwc3_qcom_is_host(qcom) && wakeup))
 		dwc3_qcom_disable_interrupts(qcom);
 
-	ret = clk_bulk_prepare_enable(qcom->num_clocks, qcom->clks);
-	if (ret < 0)
-		return ret;
+	if (!keep_connect) {
+		ret = clk_bulk_prepare_enable(qcom->num_clocks, qcom->clks);
+		if (ret < 0)
+			return ret;
 
-	ret = dwc3_qcom_interconnect_enable(qcom);
-	if (ret)
-		dev_warn(qcom->dev, "failed to enable interconnect: %d\n", ret);
+		ret = dwc3_qcom_interconnect_enable(qcom);
+		if (ret)
+			dev_warn(qcom->dev, "failed to enable interconnect: %d\n", ret);
 
-	if (qcom->utmi_as_pipe_clk)
-		dwc3_qcom_select_utmi_clk(qcom);
+		if (qcom->utmi_as_pipe_clk)
+			dwc3_qcom_select_utmi_clk(qcom);
+	}
 
 	/* Clear existing events from PHY related to L2 in/out */
 	for (i = 0; i < qcom->num_ports; i++) {
@@ -416,6 +443,7 @@ static int dwc3_qcom_resume(struct dwc3_qcom *qcom, bool wakeup)
 				  PWR_EVNT_LPM_IN_L2_MASK | PWR_EVNT_LPM_OUT_L2_MASK);
 	}
 
+	qcom->keep_connect = false;
 	qcom->is_suspended = false;
 
 	return 0;
@@ -695,10 +723,12 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 		dwc3_qcom_vbus_override_enable(qcom, true);
 	} else {
 		if ((device_property_read_bool(dev, "usb-role-switch")) &&
-		    (usb_get_role_switch_default_mode(dev) == USB_DR_MODE_HOST))
+		    (usb_get_role_switch_default_mode(dev) == USB_DR_MODE_HOST)) {
 			qcom->current_role = USB_ROLE_HOST;
-		else
+		} else {
 			qcom->current_role = USB_ROLE_DEVICE;
+			dwc3_qcom_vbus_override_enable(qcom, true);
+		}
 	}
 
 	qcom->dwc.glue_ops = &dwc3_qcom_glue_ops;

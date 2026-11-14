@@ -181,6 +181,7 @@ struct msm_dsi_host {
 	/* lane data parsed via DT */
 	int dlane_swap;
 	int num_data_lanes;
+	bool null_insertion_enabled;
 
 	/* from phy DT */
 	bool cphy_mode;
@@ -878,6 +879,15 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 
 			dsi_write(msm_host, REG_DSI_CMD_MODE_MDP_CTRL2, data);
 		}
+
+		data = 0;
+		if (msm_host->null_insertion_enabled) {
+			data = DSI_COMMAND_MODE_NULL_INSERTION_CTRL_EN;
+			data |= DSI_COMMAND_MODE_NULL_INSERTION_CTRL_VC_ID(msm_host->channel);
+			data |= DSI_COMMAND_MODE_NULL_INSERTION_CTRL_WORD_COUNT(0);
+		}
+		dsi_write(msm_host, REG_DSI_COMMAND_MODE_NULL_INSERTION_CTRL,
+			  data);
 	}
 
 	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL,
@@ -987,12 +997,14 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
 	reg |= DSI_VIDEO_COMPRESSION_MODE_CTRL_EN;
 
 	if (is_cmd_mode) {
-		reg_ctrl = dsi_read(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL);
+		/*
+		 * The bootloader or a previous modeset can leave STREAM1
+		 * enabled. This driver only programs STREAM0, so clear both
+		 * halves instead of preserving the stale STREAM1 fields.
+		 */
+		reg_ctrl = reg;
+
 		reg_ctrl2 = dsi_read(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL2);
-
-		reg_ctrl &= ~0xffff;
-		reg_ctrl |= reg;
-
 		reg_ctrl2 &= ~DSI_COMMAND_COMPRESSION_MODE_CTRL2_STREAM0_SLICE_WIDTH__MASK;
 		reg_ctrl2 |= DSI_COMMAND_COMPRESSION_MODE_CTRL2_STREAM0_SLICE_WIDTH(dsc->slice_chunk_size);
 
@@ -1962,6 +1974,9 @@ static int dsi_host_parse_dt(struct msm_dsi_host *msm_host)
 	struct device_node *endpoint;
 	const char *te_source;
 	int ret = 0;
+
+	msm_host->null_insertion_enabled =
+		of_property_read_bool(np, "qcom,null-insertion-enabled");
 
 	/*
 	 * Get the endpoint of the output port of the DSI host. In our case,

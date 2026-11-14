@@ -235,26 +235,3 @@ config USB_DWC3_GOOGLE
 	  module will be called dwc3-google.ko.
 
 endif
-
-config USB_DWC3_SAMURAI_APSD_OWNER
-	bool "Samurai APSD DWC lifecycle coordinator"
-	depends on USB_DWC3=y && USB_DWC3_GADGET
-	depends on PHY_QCOM_USB_SNPS_FEMTO_V2=y && POWER_SUPPLY=y
-	default n
-
-config USB_DWC3_SAMURAI_APSD_PD5V_CLIENT
-	bool "Samurai pre-attach PD-disabled client bridge"
-	depends on USB_DWC3_SAMURAI_APSD_OWNER && OF
-	depends on TYPEC_TCPM=y && TYPEC_QCOM_PMIC=y
-	default n
-
-config USB_DWC3_SAMURAI_APSD_EUD_OFF_CLIENT
-	bool "Samurai explicit EFI EUD-off route client"
-	depends on USB_DWC3_SAMURAI_APSD_PD5V_CLIENT
-	depends on QCOM_SAMURAI_EUD_ROUTE=y
-	default n
-	help
-	  Also needs the actual samurai,apsd-eud-route phandle. The route
-	  provider excludes every paired debug producer; no COM quiet-window
-	  fallback exists. Boot evidence currently expires at the first PM
-	  prepare. Full PM route revalidation and device validation remain.

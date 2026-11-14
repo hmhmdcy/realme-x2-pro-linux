@@ -123,6 +123,13 @@ properties:
       Indicates if the DSI controller needs to sync the other DSI controller
       with MIPI DCS commands when qcom,dual-dsi-mode enabled.
 
+  qcom,null-insertion-enabled:
+    type: boolean
+    description:
+      Enable insertion of null packets in command mode. This is required on
+      some controllers to keep compressed command-mode streams aligned and
+      avoid display corruption.
+
   assigned-clocks:
     minItems: 2
     maxItems: 4

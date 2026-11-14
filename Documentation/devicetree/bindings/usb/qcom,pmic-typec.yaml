@@ -85,6 +85,10 @@ properties:
   vdd-pdphy-supply:
     description: VDD regulator supply to the PDPHY.
 
+  wakeup-source:
+    type: boolean
+    description: Enable Type-C attach and VBUS interrupts as system wakeup sources.
+
 required:
   - compatible
   - reg

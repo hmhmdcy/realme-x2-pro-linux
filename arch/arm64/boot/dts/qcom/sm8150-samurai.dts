@@ -23,6 +23,12 @@
 	status = "disabled";
 };
 
+/*
+ * Use the standard gadget suspend/resume model.  The keep-connect RFC is
+ * intentionally not enabled: this board has no proven VBUS/attach source for
+ * the controller, so an unplugged cable can leave the stale U3 state looking
+ * like a host-suspended link and the armed DP wake IRQ then aborts suspend.
+ */
 &usb_1_dwc3 {
 	status = "okay";
 	dr_mode = "peripheral";

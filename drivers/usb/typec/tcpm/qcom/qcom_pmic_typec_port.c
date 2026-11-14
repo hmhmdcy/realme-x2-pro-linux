@@ -179,6 +179,7 @@ struct pmic_typec_port {
 	int				cc;
 	bool				debouncing_cc;
 	struct delayed_work		cc_debounce_dwork;
+	bool				wake_armed;
 
 	spinlock_t			lock;	/* Register atomicity */
 };
@@ -689,6 +690,85 @@ done:
 	return ret;
 }
 
+static bool
+qcom_pmic_typec_port_is_wake_irq(const struct pmic_typec_port_irq_data *irq_data)
+{
+	switch (irq_data->virq) {
+	case PMIC_TYPEC_CC_STATE_IRQ:
+	case PMIC_TYPEC_VBUS_IRQ:
+	case PMIC_TYPEC_ATTACH_DETACH_IRQ:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int qcom_pmic_typec_port_set_wake(struct pmic_typec *tcpm, bool enable)
+{
+	struct pmic_typec_port *pmic_typec_port = tcpm->pmic_typec_port;
+	struct device *dev = pmic_typec_port->dev;
+	unsigned long armed = 0;
+	int ret = 0;
+	int i;
+
+	if (!enable && !pmic_typec_port->wake_armed)
+		return 0;
+
+	if (enable && !device_may_wakeup(dev))
+		return 0;
+
+	if (pmic_typec_port->wake_armed == enable)
+		return 0;
+
+	for (i = 0; i < pmic_typec_port->nr_irqs; i++) {
+		struct pmic_typec_port_irq_data *irq_data =
+			&pmic_typec_port->irq_data[i];
+
+		if (!qcom_pmic_typec_port_is_wake_irq(irq_data))
+			continue;
+
+		if (enable)
+			ret = enable_irq_wake(irq_data->irq);
+		else
+			ret = disable_irq_wake(irq_data->irq);
+		if (ret) {
+			dev_err(dev, "failed to %s wake IRQ %d: %d\n",
+				enable ? "enable" : "disable",
+				irq_data->irq, ret);
+			goto unwind;
+		}
+		armed |= BIT(i);
+	}
+
+	pmic_typec_port->wake_armed = enable;
+	return 0;
+
+unwind:
+	for (i = pmic_typec_port->nr_irqs - 1; i >= 0; i--) {
+		struct pmic_typec_port_irq_data *irq_data =
+			&pmic_typec_port->irq_data[i];
+
+		if (!(armed & BIT(i)))
+			continue;
+
+		if (enable)
+			disable_irq_wake(irq_data->irq);
+		else
+			enable_irq_wake(irq_data->irq);
+	}
+	return ret;
+}
+
+int qcom_pmic_typec_port_suspend(struct pmic_typec *tcpm)
+{
+	return qcom_pmic_typec_port_set_wake(tcpm, true);
+}
+
+int qcom_pmic_typec_port_resume(struct pmic_typec *tcpm)
+{
+	return qcom_pmic_typec_port_set_wake(tcpm, false);
+}
+
 static void qcom_pmic_typec_port_stop(struct pmic_typec *tcpm)
 {
 	struct pmic_typec_port *pmic_typec_port = tcpm->pmic_typec_port;
@@ -769,6 +849,12 @@ int qcom_pmic_typec_port_probe(struct platform_device *pdev,
 	}
 
 	tcpm->pmic_typec_port = pmic_typec_port;
+
+	if (device_property_read_bool(dev, "wakeup-source")) {
+		ret = devm_device_init_wakeup(dev);
+		if (ret)
+			return ret;
+	}
 
 	tcpm->tcpc.get_vbus = qcom_pmic_typec_port_get_vbus;
 	tcpm->tcpc.set_vbus = qcom_pmic_typec_port_set_vbus;

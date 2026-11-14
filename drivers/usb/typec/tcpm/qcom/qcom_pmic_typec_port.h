@@ -31,5 +31,7 @@ int qcom_pmic_typec_port_probe(struct platform_device *pdev,
 			       const struct pmic_typec_port_resources *res,
 			       struct regmap *regmap,
 			       u32 base);
+int qcom_pmic_typec_port_suspend(struct pmic_typec *tcpm);
+int qcom_pmic_typec_port_resume(struct pmic_typec *tcpm);
 
 #endif /* __QCOM_PMIC_TYPE_C_PORT_H__ */

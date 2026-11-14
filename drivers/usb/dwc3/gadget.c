@@ -4994,6 +4994,22 @@ int dwc3_gadget_suspend(struct dwc3 *dwc)
 {
 	int ret;
 
+	if (dwc3_gadget_keep_connect(dwc)) {
+		int link_state = dwc3_gadget_get_link_state(dwc);
+
+		/*
+		 * We cannot service USB transactions while the system is
+		 * asleep.  Only keep the gadget connected if the host has
+		 * already suspended the bus, so resume is the only event
+		 * that can arrive.
+		 */
+		if (link_state != DWC3_LINK_STATE_U3)
+			return -EBUSY;
+
+		dwc3_gadget_disable_irq(dwc);
+		return 0;
+	}
+
 	ret = dwc3_gadget_soft_disconnect(dwc);
 	/*
 	 * Attempt to reset the controller's state. Likely no
@@ -5012,7 +5028,34 @@ int dwc3_gadget_suspend(struct dwc3 *dwc)
 
 int dwc3_gadget_resume(struct dwc3 *dwc)
 {
-	if (!dwc->gadget_driver || !dwc->softconnect)
+	irqreturn_t irq;
+
+	if (!dwc->gadget_driver)
+		return 0;
+
+	if (dwc3_gadget_keep_connect(dwc)) {
+		dwc3_gadget_enable_irq(dwc);
+
+		/*
+		 * The resume event may already be pending.  Drain it now
+		 * instead of waiting for the next interrupt.
+		 */
+		irq = dwc3_check_event_buf(dwc->ev_buf);
+		if (irq == IRQ_WAKE_THREAD)
+			dwc3_process_event_buf(dwc->ev_buf);
+
+		/*
+		 * A cable event is not a U3->U0 host resume: the gadget
+		 * session is gone.  Let the core reinitialise the
+		 * controller instead of resuming a stale link.
+		 */
+		if (dwc->gadget->state != USB_STATE_CONFIGURED)
+			return -EAGAIN;
+
+		return 0;
+	}
+
+	if (!dwc->softconnect)
 		return 0;
 
 	return dwc3_gadget_soft_connect(dwc);

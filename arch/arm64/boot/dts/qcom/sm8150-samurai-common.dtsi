@@ -498,6 +498,7 @@
 &mdss_dsi0 {
 	status = "okay";
 	vdda-supply = <&vreg_l3c_1p2>;
+	qcom,null-insertion-enabled;
 	pinctrl-names = "default";
 	pinctrl-0 = <&display_te_default>;
 

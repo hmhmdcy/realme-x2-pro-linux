@@ -1,25 +1,36 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* MP2650 input/status support. Control is not enabled until the board's
- * protection chain and input budget are verified. This driver never writes
- * configuration, enables ADC, services the watchdog or reads fault REG14.
+/* MP2650 input/status support plus the board's OTG VBUS regulator.
+ *
+ * Charging control is still deliberately read-only: the driver does not
+ * touch current/voltage limits, BATFET, the watchdog or fault configuration.
+ * The only write path is the standard USB OTG boost enable: REG08 CHG_EN is
+ * released, REG08 OTG_EN is asserted, and the board's OTG pin is driven high.
  * MPS Rev1.0 REG13 ACOK is active high; the OEM header reverses its constants.
  */
 #include <linux/bitfield.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
+#include <linux/regulator/driver.h>
 
+#define MP2650_CHG_CFG0 0x08
 #define MP2650_STATUS 0x13
 #define MP2650_VIN_LOW 0x1c
 #define MP2650_IIN_LOW 0x1e
+#define MP2650_OTG_EN BIT(5)
+#define MP2650_CHG_EN BIT(4)
 #define MP2650_ACOK BIT(1)
 #define MP2650_CHG_STAT GENMASK(3, 2)
 
 struct mp2650 {
 	struct i2c_client *client;
 	struct mutex lock;
+	struct gpio_desc *otg_gpio;
+	int saved_reg08;
 };
 
 static int mp2650_read(struct mp2650 *mp, unsigned int reg)
@@ -143,6 +154,110 @@ static const struct power_supply_desc mp2650_supply = {
 	.get_property = mp2650_get_property,
 };
 
+#if IS_ENABLED(CONFIG_REGULATOR)
+static int mp2650_vbus_enable(struct regulator_dev *rdev)
+{
+	struct mp2650 *mp = rdev_get_drvdata(rdev);
+	int old, ret;
+
+	mutex_lock(&mp->lock);
+	old = i2c_smbus_read_byte_data(mp->client, MP2650_CHG_CFG0);
+	if (old < 0) {
+		ret = old;
+		goto out;
+	}
+
+	mp->saved_reg08 = old;
+	gpiod_set_value_cansleep(mp->otg_gpio, 1);
+	ret = i2c_smbus_write_byte_data(mp->client, MP2650_CHG_CFG0,
+					(old & ~MP2650_CHG_EN) | MP2650_OTG_EN);
+	if (ret < 0)
+		gpiod_set_value_cansleep(mp->otg_gpio, 0);
+out:
+	mutex_unlock(&mp->lock);
+	return ret;
+}
+
+static int mp2650_vbus_disable(struct regulator_dev *rdev)
+{
+	struct mp2650 *mp = rdev_get_drvdata(rdev);
+	int ret;
+
+	mutex_lock(&mp->lock);
+	if (mp->saved_reg08 < 0)
+		ret = -EINVAL;
+	else
+		ret = i2c_smbus_write_byte_data(mp->client, MP2650_CHG_CFG0,
+						mp->saved_reg08);
+	gpiod_set_value_cansleep(mp->otg_gpio, 0);
+	mutex_unlock(&mp->lock);
+	return ret;
+}
+
+static int mp2650_vbus_is_enabled(struct regulator_dev *rdev)
+{
+	struct mp2650 *mp = rdev_get_drvdata(rdev);
+	int ret;
+
+	mutex_lock(&mp->lock);
+	ret = i2c_smbus_read_byte_data(mp->client, MP2650_CHG_CFG0);
+	mutex_unlock(&mp->lock);
+	if (ret < 0)
+		return ret;
+
+	return !!(ret & MP2650_OTG_EN);
+}
+
+static const struct regulator_ops mp2650_vbus_ops = {
+	.enable = mp2650_vbus_enable,
+	.disable = mp2650_vbus_disable,
+	.is_enabled = mp2650_vbus_is_enabled,
+};
+
+static const struct regulator_desc mp2650_vbus_desc = {
+	.name = "mp2650-vbus",
+	.of_match = "usb-otg-vbus",
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.ops = &mp2650_vbus_ops,
+	.fixed_uV = 5000000,
+	.n_voltages = 1,
+	.enable_time = 750000,
+};
+
+static int mp2650_register_vbus(struct mp2650 *mp)
+{
+	struct device *dev = &mp->client->dev;
+	struct device_node *np;
+	struct regulator_config config = {};
+	struct regulator_dev *rdev;
+
+	if (!mp->otg_gpio)
+		return 0;
+
+	np = of_get_child_by_name(dev->of_node, "usb-otg-vbus");
+	if (!np) {
+		dev_warn(dev, "otg-gpios without usb-otg-vbus child; OTG VBUS disabled\n");
+		return 0;
+	}
+	of_node_put(np);
+
+	config.dev = dev;
+	config.driver_data = mp;
+	rdev = devm_regulator_register(dev, &mp2650_vbus_desc, &config);
+	if (IS_ERR(rdev))
+		return dev_err_probe(dev, PTR_ERR(rdev),
+				     "failed to register OTG VBUS regulator\n");
+
+	return 0;
+}
+#else
+static int mp2650_register_vbus(struct mp2650 *mp)
+{
+	return 0;
+}
+#endif
+
 static int mp2650_probe(struct i2c_client *client)
 {
 	struct power_supply_config config = {};
@@ -159,14 +274,22 @@ static int mp2650_probe(struct i2c_client *client)
 	if (!mp)
 		return -ENOMEM;
 	mp->client = client;
+	mp->saved_reg08 = -1;
 	mutex_init(&mp->lock);
+	mp->otg_gpio = devm_gpiod_get_optional(&client->dev, "otg", GPIOD_OUT_LOW);
+	if (IS_ERR(mp->otg_gpio))
+		return dev_err_probe(&client->dev, PTR_ERR(mp->otg_gpio),
+				     "failed to get OTG GPIO\n");
 	status = mp2650_read(mp, MP2650_STATUS);
 	if (status < 0)
 		return status;
 	config.drv_data = mp;
 	config.fwnode = dev_fwnode(&client->dev);
 	psy = devm_power_supply_register(&client->dev, &mp2650_supply, &config);
-	return PTR_ERR_OR_ZERO(psy);
+	if (IS_ERR(psy))
+		return PTR_ERR(psy);
+
+	return mp2650_register_vbus(mp);
 }
 
 static const struct of_device_id mp2650_of_match[] = {
@@ -191,5 +314,5 @@ static struct i2c_driver mp2650_driver = {
 };
 module_i2c_driver(mp2650_driver);
 
-MODULE_DESCRIPTION("MP2650 input and charger status support");
+MODULE_DESCRIPTION("MP2650 input, charger status and OTG VBUS support");
 MODULE_LICENSE("GPL");

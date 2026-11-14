@@ -1403,6 +1403,8 @@ struct dwc3 {
 	unsigned		usb2_lpm_disable:1;
 	unsigned		usb2_gadget_lpm_disable:1;
 	unsigned		needs_full_reinit:1;
+	unsigned		gadget_keep_connect_sys_sleep:1;
+	unsigned		keep_connect_fallback:1;
 
 	unsigned		disable_scramble_quirk:1;
 	unsigned		u2exit_lfps_quirk:1;
@@ -1683,6 +1685,14 @@ static inline int dwc3_host_init(struct dwc3 *dwc)
 static inline void dwc3_host_exit(struct dwc3 *dwc)
 { }
 #endif
+
+static inline bool dwc3_gadget_keep_connect(struct dwc3 *dwc)
+{
+	return dwc->gadget_keep_connect_sys_sleep &&
+	       !dwc->keep_connect_fallback &&
+	       dwc->current_dr_role == DWC3_GCTL_PRTCAP_DEVICE &&
+	       dwc->connected;
+}
 
 #if IS_ENABLED(CONFIG_USB_DWC3_GADGET) || IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE)
 int dwc3_gadget_init(struct dwc3 *dwc);

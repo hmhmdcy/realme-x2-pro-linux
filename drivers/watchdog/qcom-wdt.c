@@ -23,6 +23,11 @@ enum wdt_reg {
 
 #define QCOM_WDT_ENABLE		BIT(0)
 
+static bool keep_running_in_suspend;
+module_param(keep_running_in_suspend, bool, 0644);
+MODULE_PARM_DESC(keep_running_in_suspend,
+		 "Keep the hardware watchdog running across system suspend");
+
 static const u32 reg_offset_data_apcs_tmr[] = {
 	[WDT_RST] = 0x38,
 	[WDT_EN] = 0x40,
@@ -362,8 +367,12 @@ static int __maybe_unused qcom_wdt_suspend(struct device *dev)
 {
 	struct qcom_wdt *wdt = dev_get_drvdata(dev);
 
-	if (watchdog_active(&wdt->wdd))
-		qcom_wdt_stop(&wdt->wdd);
+	if (watchdog_active(&wdt->wdd)) {
+		if (keep_running_in_suspend)
+			qcom_wdt_ping(&wdt->wdd);
+		else
+			qcom_wdt_stop(&wdt->wdd);
+	}
 
 	return 0;
 }

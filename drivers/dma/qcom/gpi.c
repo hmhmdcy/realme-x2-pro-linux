@@ -2065,6 +2065,14 @@ static int gpi_alloc_chan_resources(struct dma_chan *chan)
 		goto xfer_alloc_err;
 
 	ret = gpi_ch_init(gchan);
+	if (ret) {
+		gpi_free_ring(&gchan->ch_ring, gpii);
+		write_lock_irq(&gpii->pm_lock);
+		gchan->pm_state = DISABLE_STATE;
+		if (gpii->pm_state == PREPARE_HARDWARE)
+			gpii->pm_state = DISABLE_STATE;
+		write_unlock_irq(&gpii->pm_lock);
+	}
 
 	mutex_unlock(&gpii->ctrl_lock);
 
