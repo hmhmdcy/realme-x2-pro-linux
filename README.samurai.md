@@ -39,11 +39,20 @@ git clone --branch stable \
   https://github.com/hmhmdcy/realme-x2-pro-linux.git
 cd realme-x2-pro-linux
 make O=/fixed/linux-kernel8-build ARCH=arm64 \
-  CROSS_COMPILE=aarch64-linux-gnu- KCONFIG_ALLCONFIG=$PWD/samurai.config.kernel8 \
+  CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=-usbwake-otg \
+  KCONFIG_ALLCONFIG=$PWD/samurai.config.kernel8 \
   allnoconfig
 make O=/fixed/linux-kernel8-build ARCH=arm64 \
-  CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image modules
+  CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=-usbwake-otg \
+  -j"$(nproc)" Image modules
 ```
+
+The release name is not fully represented by `CONFIG_LOCALVERSION` alone.
+The build used `LOCALVERSION=-usbwake-otg` as an environment override, so
+the resulting release is
+`7.3.1-rmx1931-samurai-v731-usbwake-otg`.  Without that override the tree
+builds `7.3.1-rmx1931-samurai-v731+`, which does not match the published
+module archive.
 
 The recorded compiler was GCC 15.2.0 with GNU ld 2.46; a different
 toolchain can produce a different Image hash even with identical source
